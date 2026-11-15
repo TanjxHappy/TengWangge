@@ -1,28 +1,41 @@
 #include "tools/core_analyze_high/high_tool.h"
 
+#include <QAbstractItemView>
+#include <QClipboard>
+#include <QDialog>
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFrame>
-#include <QGridLayout>
+#include <QGuiApplication>
 #include <QHBoxLayout>
+#include <QHeaderView>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
-#include <QScrollArea>
+#include <QResizeEvent>
+#include <QShortcut>
+#include <QShowEvent>
 #include <QSizePolicy>
+#include <QSplitter>
 #include <QStringList>
+#include <QTableWidget>
+#include <QTextCursor>
+#include <QTextDocument>
 #include <QVBoxLayout>
 #include <QVariant>
 
 namespace tw {
 namespace {
 
-// 换行标签的 minimumSizeHint 在宽度还没确定时会非常高，把结论和导出按钮顶出窗口。
-// 这里把最小高度收成一行，真正高度仍由布局按宽度计算。
+// 换行标签在宽度未知时的 minimumSizeHint 会非常高。先按一行计，
+// 显示之后再按实际宽度把最小高度收到能放下全文。
 class BoundLabel : public QLabel
 {
 public:
@@ -44,6 +57,20 @@ BoundLabel *makeLabel(const QString &text, const char *role)
     auto *label = new BoundLabel(text);
     label->setProperty("role", QString::fromLatin1(role));
     return label;
+}
+
+QFrame *makeCard()
+{
+    auto *frame = new QFrame;
+    frame->setProperty("role", QStringLiteral("card"));
+    frame->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    return frame;
+}
+
+void plainButton(QPushButton *button)
+{
+    button->setAutoDefault(false);
+    button->setDefault(false);
 }
 
 QWidget *pathRow(QLabel *label, QLineEdit *edit, QPushButton *browse, QPushButton *extra = nullptr)
@@ -73,6 +100,56 @@ QString startDirectory(const QLineEdit *edit)
     return QDir::homePath();
 }
 
+QString sliceDocument(const QString &document, const QString &marker, const QString &next)
+{
+    const int from = document.indexOf(marker);
+    if (from < 0)
+        return {};
+    int to = document.size();
+    if (!next.isEmpty()) {
+        const int found = document.indexOf(next, from + marker.size());
+        if (found >= 0)
+            to = found;
+    }
+    return document.mid(from, to - from).trimmed();
+}
+
+QString stepDetailText(const TriageStep &step, const QString &section)
+{
+    QString detail;
+    detail += step.heading;
+    detail += QLatin1Char('\n');
+    if (!step.purpose.isEmpty()) {
+        detail += step.purpose;
+        detail += QLatin1Char('\n');
+    }
+    if (!step.commandLine.isEmpty()) {
+        detail += QStringLiteral("\n命令\n");
+        detail += step.commandLine;
+        detail += QLatin1Char('\n');
+    }
+    if (!step.situation.isEmpty()) {
+        detail += QStringLiteral("\n本次情况\n");
+        detail += step.situation;
+        detail += QLatin1Char('\n');
+    }
+    if (!step.excerpt.isEmpty()) {
+        detail += QStringLiteral("\n关键输出\n");
+        detail += step.excerpt;
+        detail += QLatin1Char('\n');
+    }
+    if (!step.meaning.isEmpty()) {
+        detail += QStringLiteral("\n中文释义\n");
+        detail += step.meaning;
+        detail += QLatin1Char('\n');
+    }
+    if (step.commandLine.isEmpty() && !section.isEmpty()) {
+        detail += QLatin1Char('\n');
+        detail += section;
+    }
+    return detail.trimmed();
+}
+
 } // namespace
 
 TriageThread::TriageThread(TriageInput input, ToolLocator locator, ArgvHostFactory factory,
@@ -100,56 +177,44 @@ HighAnalyzePage::HighAnalyzePage(const ToolServices &services, QWidget *dialogPa
     , m_services(services)
     , m_dialogParent(dialogParent)
 {
+    // 四块可拖动区域：步骤表、结论、本步详情、底部说明。
+    // 分栏只借鉴调试器里常见的「列表 + 详情 + 底部日志」，不搬那些项目的代码。
     auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(16, 12, 16, 12);
-    layout->setSpacing(8);
-
-    layout->addWidget(makeLabel(QStringLiteral("文件分析high"), "pageTitle"));
-    layout->addWidget(makeLabel(
-        QStringLiteral("选择 Linux core 文件，查看程序为何停止，并生成一份能看懂的说明。"),
-        "pageSubtitle"));
-
-    auto *pick = new QFrame;
-    pick->setProperty("role", QStringLiteral("card"));
-    pick->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
-    auto *pickLayout = new QVBoxLayout(pick);
-    pickLayout->setContentsMargins(12, 10, 12, 10);
-    pickLayout->setSpacing(6);
+    layout->setContentsMargins(8, 6, 8, 6);
+    layout->setSpacing(6);
 
     m_coreEdit = new QLineEdit;
     m_coreEdit->setObjectName(QStringLiteral("coreFileEdit"));
     m_coreEdit->setPlaceholderText(QStringLiteral("选择 core 文件"));
     m_coreEdit->setAccessibleName(QStringLiteral("core 文件"));
     m_coreEdit->setClearButtonEnabled(true);
+    m_coreEdit->setToolTip(QStringLiteral("选择 Linux core 文件。程序文件和调试符号在「条件」里，可以留空。"));
+
     auto *coreBrowse = new QPushButton(QStringLiteral("浏览"));
+    plainButton(coreBrowse);
     coreBrowse->setAccessibleName(QStringLiteral("浏览 core 文件"));
 
-    m_programEdit = new QLineEdit;
-    m_programEdit->setObjectName(QStringLiteral("programFileEdit"));
-    m_programEdit->setPlaceholderText(QStringLiteral("可选"));
-    m_programEdit->setAccessibleName(QStringLiteral("程序文件"));
-    m_programEdit->setClearButtonEnabled(true);
-    auto *programBrowse = new QPushButton(QStringLiteral("浏览"));
-    programBrowse->setAccessibleName(QStringLiteral("浏览程序文件"));
+    auto *conditions = new QPushButton(QStringLiteral("条件"));
+    plainButton(conditions);
+    conditions->setObjectName(QStringLiteral("conditionButton"));
+    conditions->setAccessibleName(QStringLiteral("分析条件"));
+    conditions->setToolTip(QStringLiteral("可选：程序文件与调试符号。留空也可以分析。"));
 
-    m_debugEdit = new QLineEdit;
-    m_debugEdit->setObjectName(QStringLiteral("debugPathEdit"));
-    m_debugEdit->setPlaceholderText(QStringLiteral("可选，文件或目录"));
-    m_debugEdit->setAccessibleName(QStringLiteral("调试符号"));
-    m_debugEdit->setClearButtonEnabled(true);
-    auto *debugFile = new QPushButton(QStringLiteral("文件"));
-    debugFile->setAccessibleName(QStringLiteral("浏览调试符号文件"));
-    auto *debugDir = new QPushButton(QStringLiteral("目录"));
-    debugDir->setAccessibleName(QStringLiteral("浏览调试符号目录"));
+    m_run = new QPushButton(QStringLiteral("开始分析"));
+    plainButton(m_run);
+    m_run->setObjectName(QStringLiteral("runButton"));
+    m_run->setProperty("role", QStringLiteral("primary"));
+    m_run->setAccessibleName(QStringLiteral("开始分析"));
 
-    pickLayout->addWidget(pathRow(makeLabel(QStringLiteral("core 文件"), "fieldLabel"), m_coreEdit,
-                                  coreBrowse));
-    pickLayout->addWidget(pathRow(makeLabel(QStringLiteral("程序文件"), "fieldLabel"), m_programEdit,
-                                  programBrowse));
-    pickLayout->addWidget(pathRow(makeLabel(QStringLiteral("调试符号"), "fieldLabel"), m_debugEdit,
-                                  debugFile, debugDir));
-    pickLayout->addWidget(makeLabel(
-        QStringLiteral("调试符号用来把地址翻译成步骤名。没有也可以分析。"), "hint"));
+    m_stop = new QPushButton(QStringLiteral("取消"));
+    plainButton(m_stop);
+    m_stop->setObjectName(QStringLiteral("stopButton"));
+    m_stop->setAccessibleName(QStringLiteral("取消分析"));
+
+    m_save = new QPushButton(QStringLiteral("导出说明"));
+    plainButton(m_save);
+    m_save->setObjectName(QStringLiteral("saveButton"));
+    m_save->setAccessibleName(QStringLiteral("导出分析说明"));
 
     m_bar = new QProgressBar;
     m_bar->setObjectName(QStringLiteral("progressBar"));
@@ -157,113 +222,240 @@ HighAnalyzePage::HighAnalyzePage(const ToolServices &services, QWidget *dialogPa
     m_bar->setRange(0, 1);
     m_bar->setValue(0);
     m_bar->setTextVisible(false);
-    m_progress = makeLabel(QStringLiteral("尚未分析"), "hint");
+    m_bar->setFixedWidth(72);
+
+    m_progress = new QLabel(QStringLiteral("尚未分析"));
+    m_progress->setProperty("role", QStringLiteral("hint"));
     m_progress->setObjectName(QStringLiteral("progressLabel"));
+    m_progress->setWordWrap(false);
+    m_progress->setMinimumWidth(72);
+    m_progressFull = m_progress->text();
 
-    auto *buttons = new QHBoxLayout;
-    buttons->setSpacing(8);
-    m_run = new QPushButton(QStringLiteral("开始分析"));
-    m_run->setObjectName(QStringLiteral("runButton"));
-    m_run->setProperty("role", QStringLiteral("primary"));
-    m_run->setAccessibleName(QStringLiteral("开始分析"));
-    m_run->setDefault(true);
-    m_stop = new QPushButton(QStringLiteral("取消"));
-    m_stop->setObjectName(QStringLiteral("stopButton"));
-    m_stop->setAccessibleName(QStringLiteral("取消分析"));
-    m_save = new QPushButton(QStringLiteral("导出说明"));
-    m_save->setObjectName(QStringLiteral("saveButton"));
-    m_save->setAccessibleName(QStringLiteral("导出分析说明"));
-    buttons->addWidget(m_run);
-    buttons->addWidget(m_stop);
-    buttons->addWidget(m_save);
-    buttons->addStretch(1);
+    auto *toolbar = new QHBoxLayout;
+    toolbar->setSpacing(6);
+    auto *coreName = makeLabel(QStringLiteral("core"), "fieldLabel");
+    coreName->setToolTip(QStringLiteral("程序异常退出时留下的 core 文件"));
+    toolbar->addWidget(coreName);
+    toolbar->addWidget(m_coreEdit, 1);
+    toolbar->addWidget(coreBrowse);
+    toolbar->addWidget(conditions);
+    toolbar->addWidget(m_run);
+    toolbar->addWidget(m_stop);
+    toolbar->addWidget(m_save);
+    toolbar->addWidget(m_bar);
+    toolbar->addWidget(m_progress);
+    layout->addLayout(toolbar);
 
-    pickLayout->addWidget(m_bar);
-    pickLayout->addWidget(m_progress);
-    pickLayout->addLayout(buttons);
-    layout->addWidget(pick);
+    m_conditions = new QDialog(this);
+    m_conditions->setObjectName(QStringLiteral("conditionDialog"));
+    m_conditions->setWindowTitle(QStringLiteral("分析条件"));
+    m_conditions->setModal(true);
+    auto *conditionLayout = new QVBoxLayout(m_conditions);
+    conditionLayout->setContentsMargins(12, 12, 12, 12);
+    conditionLayout->setSpacing(8);
+    m_programEdit = new QLineEdit(m_conditions);
+    m_programEdit->setObjectName(QStringLiteral("programFileEdit"));
+    m_programEdit->setPlaceholderText(QStringLiteral("可选"));
+    m_programEdit->setAccessibleName(QStringLiteral("程序文件"));
+    m_programEdit->setClearButtonEnabled(true);
+    m_programEdit->setToolTip(QStringLiteral("生成这份 core 的程序。对不上也可以先不填。"));
+    auto *programBrowse = new QPushButton(QStringLiteral("浏览"), m_conditions);
+    plainButton(programBrowse);
+    programBrowse->setAccessibleName(QStringLiteral("浏览程序文件"));
 
-    auto *body = new QWidget;
-    body->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    auto *bodyLayout = new QHBoxLayout(body);
-    bodyLayout->setContentsMargins(0, 0, 0, 0);
-    bodyLayout->setSpacing(12);
+    m_debugEdit = new QLineEdit(m_conditions);
+    m_debugEdit->setObjectName(QStringLiteral("debugPathEdit"));
+    m_debugEdit->setPlaceholderText(QStringLiteral("可选，文件或目录"));
+    m_debugEdit->setAccessibleName(QStringLiteral("调试符号"));
+    m_debugEdit->setClearButtonEnabled(true);
+    m_debugEdit->setToolTip(QStringLiteral("调试符号用来把地址翻译成步骤名。没有也可以分析。"));
+    auto *debugFile = new QPushButton(QStringLiteral("文件"), m_conditions);
+    plainButton(debugFile);
+    debugFile->setAccessibleName(QStringLiteral("浏览调试符号文件"));
+    auto *debugDir = new QPushButton(QStringLiteral("目录"), m_conditions);
+    plainButton(debugDir);
+    debugDir->setAccessibleName(QStringLiteral("浏览调试符号目录"));
 
-    auto *conclusion = new QFrame;
-    conclusion->setProperty("role", QStringLiteral("card"));
-    conclusion->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    conditionLayout->addWidget(pathRow(makeLabel(QStringLiteral("程序文件"), "fieldLabel"),
+                                       m_programEdit, programBrowse));
+    conditionLayout->addWidget(pathRow(makeLabel(QStringLiteral("调试符号"), "fieldLabel"),
+                                       m_debugEdit, debugFile, debugDir));
+    auto *conditionButtons = new QHBoxLayout;
+    auto *conditionOk = new QPushButton(QStringLiteral("确定"), m_conditions);
+    conditionOk->setObjectName(QStringLiteral("conditionOk"));
+    conditionOk->setDefault(true);
+    auto *conditionCancel = new QPushButton(QStringLiteral("取消"), m_conditions);
+    plainButton(conditionCancel);
+    conditionButtons->addStretch(1);
+    conditionButtons->addWidget(conditionOk);
+    conditionButtons->addWidget(conditionCancel);
+    conditionLayout->addLayout(conditionButtons);
+    m_conditions->resize(520, 160);
+    connect(conditionOk, &QPushButton::clicked, m_conditions, &QDialog::accept);
+    connect(conditionCancel, &QPushButton::clicked, m_conditions, &QDialog::reject);
+
+    m_vertical = new QSplitter(Qt::Vertical);
+    m_vertical->setObjectName(QStringLiteral("workspaceSplit"));
+    m_vertical->setChildrenCollapsible(false);
+    m_vertical->setHandleWidth(6);
+    m_columns = new QSplitter(Qt::Horizontal);
+    m_columns->setObjectName(QStringLiteral("columnSplit"));
+    m_columns->setChildrenCollapsible(false);
+    m_columns->setHandleWidth(6);
+    m_detailSplit = new QSplitter(Qt::Horizontal);
+    m_detailSplit->setObjectName(QStringLiteral("detailSplit"));
+    m_detailSplit->setChildrenCollapsible(false);
+    m_detailSplit->setHandleWidth(6);
+
+    auto *stepsCard = makeCard();
+    auto *stepsLayout = new QVBoxLayout(stepsCard);
+    stepsLayout->setContentsMargins(8, 6, 8, 6);
+    stepsLayout->setSpacing(4);
+    auto *stepsTitle = makeLabel(QStringLiteral("分析步骤"), "sectionTitle");
+    stepsTitle->setObjectName(QStringLiteral("stepTitle"));
+    stepsLayout->addWidget(stepsTitle);
+    m_steps = new QTableWidget(0, 2);
+    m_steps->setObjectName(QStringLiteral("stepTable"));
+    m_steps->setAccessibleName(QStringLiteral("分析步骤"));
+    m_steps->setHorizontalHeaderLabels({QStringLiteral("步骤"), QStringLiteral("本次情况")});
+    m_steps->verticalHeader()->setVisible(false);
+    m_steps->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_steps->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_steps->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_steps->setShowGrid(true);
+    m_steps->setWordWrap(false);
+    m_steps->setAlternatingRowColors(true);
+    m_steps->setFocusPolicy(Qt::StrongFocus);
+    m_steps->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
+    m_steps->setMinimumWidth(140);
+    m_steps->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    m_steps->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
+    m_steps->setColumnWidth(1, 96);
+    m_steps->horizontalHeader()->setStretchLastSection(false);
+    m_steps->horizontalHeader()->setToolTip(QStringLiteral("按实际执行顺序排列"));
+    m_steps->setToolTip(QStringLiteral("单击定位到下方说明，双击或按回车弹出全文，右键可复制命令。"));
+    m_steps->setContextMenuPolicy(Qt::CustomContextMenu);
+    m_steps->installEventFilter(this);
+    stepsLayout->addWidget(m_steps, 1);
+
+    auto *conclusion = makeCard();
     auto *conclusionLayout = new QVBoxLayout(conclusion);
-    conclusionLayout->setContentsMargins(12, 10, 12, 10);
-    conclusionLayout->setSpacing(6);
+    conclusionLayout->setContentsMargins(8, 6, 8, 6);
+    conclusionLayout->setSpacing(4);
     auto *conclusionTitle = makeLabel(QStringLiteral("结论"), "sectionTitle");
     conclusionTitle->setObjectName(QStringLiteral("conclusionTitle"));
+    conclusionTitle->setToolTip(QStringLiteral("单击某一项跳到相关步骤，双击弹出全文。"));
     conclusionLayout->addWidget(conclusionTitle);
 
-    auto *scroll = new QScrollArea;
-    scroll->setObjectName(QStringLiteral("conclusionScroll"));
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    scroll->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Ignored);
-    scroll->setMinimumHeight(110);
-    auto *fields = new QWidget;
-    auto *grid = new QGridLayout(fields);
-    grid->setContentsMargins(0, 0, 0, 0);
-    grid->setHorizontalSpacing(12);
-    grid->setVerticalSpacing(8);
-    grid->setColumnStretch(1, 1);
-
-    auto addValue = [&](int row, const QString &name, QLabel **slot, const QString &objectName) {
-        grid->addWidget(makeLabel(name, "fieldLabel"), row, 0, Qt::AlignTop);
+    auto addValue = [&](const QString &name, QLabel **slot, const QString &objectName) {
         auto *value = makeLabel(QStringLiteral("尚未分析"), "value");
         value->setObjectName(objectName);
         value->setTextInteractionFlags(Qt::TextSelectableByMouse);
         value->setTextFormat(Qt::PlainText);
         value->setAccessibleName(name);
-        grid->addWidget(value, row, 1);
+        value->setCursor(Qt::PointingHandCursor);
+        value->setToolTip(QStringLiteral("单击跳到相关步骤，双击查看全文。"));
+        value->installEventFilter(this);
+        auto *row = new QWidget;
+        auto *rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(0, 0, 0, 0);
+        rowLayout->setSpacing(8);
+        auto *nameLabel = makeLabel(name, "fieldLabel");
+        nameLabel->setMinimumWidth(96);
+        nameLabel->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        value->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        rowLayout->addWidget(nameLabel, 0, Qt::AlignTop);
+        rowLayout->addWidget(value, 1, Qt::AlignTop);
+        conclusionLayout->addWidget(row);
         *slot = value;
     };
-    addValue(0, QStringLiteral("报错信息"), &m_fault, QStringLiteral("faultLabel"));
-    addValue(1, QStringLiteral("所在步骤"), &m_place, QStringLiteral("placeLabel"));
-    addValue(2, QStringLiteral("可能原因"), &m_likely, QStringLiteral("likelyLabel"));
-    addValue(3, QStringLiteral("建议解决方案"), &m_advice, QStringLiteral("adviceLabel"));
-    scroll->setWidget(fields);
-    conclusionLayout->addWidget(scroll, 1);
+    addValue(QStringLiteral("报错信息"), &m_fault, QStringLiteral("faultLabel"));
+    addValue(QStringLiteral("所在步骤"), &m_place, QStringLiteral("placeLabel"));
+    addValue(QStringLiteral("可能原因"), &m_likely, QStringLiteral("likelyLabel"));
+    addValue(QStringLiteral("建议解决方案"), &m_advice, QStringLiteral("adviceLabel"));
+    conclusionLayout->addStretch(1);
 
-    auto *commands = new QWidget;
-    commands->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    auto *commandLayout = new QVBoxLayout(commands);
-    commandLayout->setContentsMargins(0, 0, 0, 0);
-    commandLayout->setSpacing(6);
-    auto *commandTitle = makeLabel(QStringLiteral("命令说明"), "sectionTitle");
+    auto *detailCard = makeCard();
+    auto *detailLayout = new QVBoxLayout(detailCard);
+    detailLayout->setContentsMargins(8, 6, 8, 6);
+    detailLayout->setSpacing(4);
+    auto *detailHeader = new QHBoxLayout;
+    detailHeader->setSpacing(6);
+    auto *detailTitle = makeLabel(QStringLiteral("本步"), "sectionTitle");
+    detailTitle->setObjectName(QStringLiteral("detailTitle"));
+    m_copy = new QPushButton(QStringLiteral("复制命令"));
+    plainButton(m_copy);
+    m_copy->setObjectName(QStringLiteral("copyCommandButton"));
+    m_copy->setAccessibleName(QStringLiteral("复制当前步骤的命令"));
+    m_copy->setToolTip(QStringLiteral("复制这一步实际使用的命令。还没分析时复制说明里的对应段落。"));
+    detailHeader->addWidget(detailTitle);
+    detailHeader->addStretch(1);
+    detailHeader->addWidget(m_copy);
+    detailLayout->addLayout(detailHeader);
+    m_detail = new QPlainTextEdit;
+    m_detail->setObjectName(QStringLiteral("stepDetailView"));
+    m_detail->setReadOnly(true);
+    m_detail->setAccessibleName(QStringLiteral("本步详情"));
+    m_detail->setLineWrapMode(QPlainTextEdit::WidgetWidth);
+    m_detail->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Ignored);
+    m_detail->setMinimumHeight(48);
+    m_detail->setToolTip(QStringLiteral("当前步骤的命令、输出和中文释义。双击左侧步骤可弹出全文。"));
+    detailLayout->addWidget(m_detail, 1);
+
+    auto *reportCard = makeCard();
+    auto *reportLayout = new QVBoxLayout(reportCard);
+    reportLayout->setContentsMargins(8, 6, 8, 6);
+    reportLayout->setSpacing(4);
+    auto *reportHeader = new QHBoxLayout;
+    reportHeader->setSpacing(6);
+    auto *commandTitle = makeLabel(QStringLiteral("分析说明"), "sectionTitle");
     commandTitle->setObjectName(QStringLiteral("commandTitle"));
-    commandLayout->addWidget(commandTitle);
-    commandLayout->addWidget(makeLabel(
-        QStringLiteral("分析完成后，这里换成这次真正执行的命令、输出和中文释义。"), "hint"));
+    m_findEdit = new QLineEdit;
+    m_findEdit->setObjectName(QStringLiteral("findEdit"));
+    m_findEdit->setPlaceholderText(QStringLiteral("在说明中查找"));
+    m_findEdit->setAccessibleName(QStringLiteral("在说明中查找"));
+    m_findEdit->setClearButtonEnabled(true);
+    m_findEdit->setMaximumWidth(220);
+    m_findEdit->setToolTip(QStringLiteral("输入文字后回车，在这份说明里定位下一处。"));
+    reportHeader->addWidget(commandTitle);
+    reportHeader->addStretch(1);
+    reportHeader->addWidget(m_findEdit);
+    reportLayout->addLayout(reportHeader);
     m_command = new QPlainTextEdit;
     m_command->setObjectName(QStringLiteral("commandView"));
     m_command->setReadOnly(true);
-    m_command->setAccessibleName(QStringLiteral("命令说明"));
+    m_command->setAccessibleName(QStringLiteral("分析说明"));
     m_command->setLineWrapMode(QPlainTextEdit::WidgetWidth);
     m_command->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Ignored);
-    m_command->setMinimumHeight(140);
+    m_command->setMinimumHeight(72);
     m_command->setPlainText(CoreTriage::primer());
-    commandLayout->addWidget(m_command, 1);
+    m_command->setToolTip(QStringLiteral("这次要执行或已经执行的命令、输出和中文释义。导出的就是这一份。"));
+    reportLayout->addWidget(m_command, 1);
 
-    bodyLayout->addWidget(conclusion, 4);
-    bodyLayout->addWidget(commands, 6);
-    layout->addWidget(body, 1);
+    m_detailSplit->addWidget(conclusion);
+    m_detailSplit->addWidget(detailCard);
+    m_columns->addWidget(stepsCard);
+    m_columns->addWidget(m_detailSplit);
+    m_vertical->addWidget(m_columns);
+    m_vertical->addWidget(reportCard);
+    m_vertical->setStretchFactor(0, 3);
+    m_vertical->setStretchFactor(1, 2);
+    m_columns->setStretchFactor(0, 2);
+    m_columns->setStretchFactor(1, 5);
+    m_detailSplit->setStretchFactor(0, 3);
+    m_detailSplit->setStretchFactor(1, 2);
+    layout->addWidget(m_vertical, 1);
 
     setTabOrder(m_coreEdit, coreBrowse);
-    setTabOrder(coreBrowse, m_programEdit);
-    setTabOrder(m_programEdit, programBrowse);
-    setTabOrder(programBrowse, m_debugEdit);
-    setTabOrder(m_debugEdit, debugFile);
-    setTabOrder(debugFile, debugDir);
-    setTabOrder(debugDir, m_run);
+    setTabOrder(coreBrowse, conditions);
+    setTabOrder(conditions, m_run);
     setTabOrder(m_run, m_stop);
     setTabOrder(m_stop, m_save);
-    setTabOrder(m_save, m_command);
+    setTabOrder(m_save, m_steps);
+    setTabOrder(m_steps, m_detail);
+    setTabOrder(m_detail, m_copy);
+    setTabOrder(m_copy, m_findEdit);
+    setTabOrder(m_findEdit, m_command);
 
     connect(coreBrowse, &QPushButton::clicked, this, [this]() {
         browseFile(m_coreEdit, QStringLiteral("选择 core 文件"));
@@ -275,14 +467,42 @@ HighAnalyzePage::HighAnalyzePage(const ToolServices &services, QWidget *dialogPa
         browseFile(m_debugEdit, QStringLiteral("选择调试符号文件"));
     });
     connect(debugDir, &QPushButton::clicked, this, &HighAnalyzePage::browseDebugDirectory);
+    connect(conditions, &QPushButton::clicked, this, &HighAnalyzePage::openConditions);
     connect(m_run, &QPushButton::clicked, this, &HighAnalyzePage::start);
+    connect(m_coreEdit, &QLineEdit::returnPressed, this, &HighAnalyzePage::start);
     connect(m_stop, &QPushButton::clicked, this, &HighAnalyzePage::cancel);
     connect(m_save, &QPushButton::clicked, this, &HighAnalyzePage::exportReport);
+    connect(m_copy, &QPushButton::clicked, this, &HighAnalyzePage::copyCurrentCommand);
+    connect(m_findEdit, &QLineEdit::returnPressed, this, &HighAnalyzePage::findInReport);
     connect(m_coreEdit, &QLineEdit::editingFinished, this, &HighAnalyzePage::storePaths);
     connect(m_programEdit, &QLineEdit::editingFinished, this, &HighAnalyzePage::storePaths);
     connect(m_debugEdit, &QLineEdit::editingFinished, this, &HighAnalyzePage::storePaths);
+    connect(m_steps, &QTableWidget::currentCellChanged, this,
+            [this](int row, int, int, int) { focusStep(row); });
+    connect(m_steps, &QTableWidget::cellDoubleClicked, this,
+            [this](int row, int) { openStepDialog(row); });
+    connect(m_steps, &QTableWidget::customContextMenuRequested, this, &HighAnalyzePage::onStepMenu);
+
+    auto rememberDrag = [this](int, int) {
+        if (!m_adjusting)
+            m_userSized = true;
+    };
+    connect(m_vertical, &QSplitter::splitterMoved, this, rememberDrag);
+    connect(m_columns, &QSplitter::splitterMoved, this, rememberDrag);
+    connect(m_detailSplit, &QSplitter::splitterMoved, this, rememberDrag);
+
+    auto *findShortcut = new QShortcut(QKeySequence::Find, this);
+    findShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(findShortcut, &QShortcut::activated, this, [this]() {
+        m_findEdit->setFocus();
+        m_findEdit->selectAll();
+    });
+    auto *cancelShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), this);
+    cancelShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(cancelShortcut, &QShortcut::activated, this, &HighAnalyzePage::cancel);
 
     loadPaths();
+    fillPreviewSteps();
     refreshControls();
 }
 
@@ -290,6 +510,44 @@ HighAnalyzePage::~HighAnalyzePage()
 {
     m_closing = true;
     abort();
+}
+
+void HighAnalyzePage::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    ensurePanes();
+}
+
+void HighAnalyzePage::resizeEvent(QResizeEvent *event)
+{
+    QWidget::resizeEvent(event);
+    if (!m_vertical || m_adjusting || m_userSized)
+        return;
+    ensurePanes();
+}
+
+bool HighAnalyzePage::eventFilter(QObject *watched, QEvent *event)
+{
+    if (watched == m_steps && event->type() == QEvent::KeyPress) {
+        auto *key = static_cast<QKeyEvent *>(event);
+        if (key->key() == Qt::Key_Return || key->key() == Qt::Key_Enter) {
+            openStepDialog(m_steps->currentRow());
+            return true;
+        }
+    }
+    auto *label = qobject_cast<QLabel *>(watched);
+    if (label == m_fault || label == m_place || label == m_likely || label == m_advice) {
+        if (event->type() == QEvent::MouseButtonDblClick) {
+            openValueDialog(label);
+            return true;
+        }
+        if (event->type() == QEvent::MouseButtonRelease) {
+            auto *mouse = static_cast<QMouseEvent *>(event);
+            if (mouse->button() == Qt::LeftButton)
+                jumpFromLabel(label);
+        }
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 void HighAnalyzePage::abort()
@@ -327,7 +585,9 @@ bool HighAnalyzePage::saveReport(const QString &path, QString *error) const
 
 void HighAnalyzePage::browseFile(QLineEdit *edit, const QString &title)
 {
-    const QString path = QFileDialog::getOpenFileName(m_dialogParent, title, startDirectory(edit),
+    QWidget *parent = m_conditions && m_conditions->isVisible() ? static_cast<QWidget *>(m_conditions)
+                                                                : m_dialogParent.data();
+    const QString path = QFileDialog::getOpenFileName(parent, title, startDirectory(edit),
                                                       QStringLiteral("所有文件 (*)"));
     if (path.isEmpty())
         return;
@@ -337,8 +597,9 @@ void HighAnalyzePage::browseFile(QLineEdit *edit, const QString &title)
 
 void HighAnalyzePage::browseDebugDirectory()
 {
-    const QString path = QFileDialog::getExistingDirectory(m_dialogParent,
-                                                           QStringLiteral("选择调试符号目录"),
+    QWidget *parent = m_conditions && m_conditions->isVisible() ? static_cast<QWidget *>(m_conditions)
+                                                                : m_dialogParent.data();
+    const QString path = QFileDialog::getExistingDirectory(parent, QStringLiteral("选择调试符号目录"),
                                                            startDirectory(m_debugEdit));
     if (path.isEmpty())
         return;
@@ -382,6 +643,261 @@ void HighAnalyzePage::storePaths() const
     file.write(text.toUtf8());
 }
 
+void HighAnalyzePage::openConditions()
+{
+    if (m_conditions->exec() == QDialog::Accepted)
+        storePaths();
+}
+
+void HighAnalyzePage::showSteps(const QVector<TriageStep> &steps, const QStringList &markers)
+{
+    m_shown = steps;
+    m_markers = markers;
+    if (m_markers.size() != steps.size()) {
+        m_markers.clear();
+        for (int i = 0; i < steps.size(); ++i)
+            m_markers << QStringLiteral("【%1】%2").arg(i + 1).arg(steps.at(i).heading);
+    }
+    m_steps->blockSignals(true);
+    m_steps->setRowCount(steps.size());
+    for (int i = 0; i < steps.size(); ++i) {
+        const TriageStep &step = steps.at(i);
+        auto *name = new QTableWidgetItem(QStringLiteral("%1  %2").arg(i + 1).arg(step.heading));
+        name->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+        name->setToolTip(step.purpose.isEmpty() ? step.heading
+                                                : step.heading + QLatin1Char('\n') + step.purpose);
+        const QString situation = step.situation.isEmpty() ? QStringLiteral("未执行") : step.situation;
+        auto *state = new QTableWidgetItem(situation);
+        state->setFlags(Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+        state->setToolTip(situation);
+        m_steps->setItem(i, 0, name);
+        m_steps->setItem(i, 1, state);
+    }
+    m_steps->blockSignals(false);
+    if (m_steps->rowCount() > 0)
+        m_steps->setCurrentCell(0, 0);
+    else
+        focusStep(-1);
+}
+
+void HighAnalyzePage::fillPreviewSteps()
+{
+    QVector<TriageStep> steps;
+    const QStringList headings = {QStringLiteral("辨认文件"), QStringLiteral("读取停止信号"),
+                                  QStringLiteral("核对调试信息"), QStringLiteral("查看停在哪一步")};
+    const QStringList markers = {QStringLiteral("1. 辨认文件"), QStringLiteral("2. 读取停止信号"),
+                                 QStringLiteral("3. 核对调试信息"), QStringLiteral("4. 查看停在哪一步")};
+    for (const QString &heading : headings) {
+        TriageStep step;
+        step.heading = heading;
+        step.situation = QStringLiteral("尚未执行");
+        step.purpose = QStringLiteral("命令和中文释义在下方说明里。");
+        steps.append(step);
+    }
+    showSteps(steps, markers);
+}
+
+void HighAnalyzePage::focusStep(int index)
+{
+    if (!m_detail)
+        return;
+    if (index < 0 || index >= m_shown.size()) {
+        m_detail->clear();
+        refreshControls();
+        return;
+    }
+    const TriageStep &step = m_shown.at(index);
+    QString section;
+    if (step.commandLine.isEmpty() && index < m_markers.size()) {
+        const QString next = index + 1 < m_markers.size() ? m_markers.at(index + 1) : QString();
+        section = sliceDocument(m_command->toPlainText(), m_markers.at(index), next);
+    }
+    m_detail->setPlainText(stepDetailText(step, section));
+    if (index < m_markers.size())
+        revealInReport(m_markers.at(index));
+    refreshControls();
+}
+
+void HighAnalyzePage::openStepDialog(int index)
+{
+    if (index < 0 || index >= m_shown.size())
+        return;
+    if (m_steps->currentRow() != index)
+        m_steps->setCurrentCell(index, 0);
+    else
+        focusStep(index);
+    showTextDialog(m_shown.at(index).heading, m_detail->toPlainText());
+}
+
+void HighAnalyzePage::openValueDialog(QLabel *label)
+{
+    if (!label)
+        return;
+    showTextDialog(label->accessibleName(), label->text());
+}
+
+void HighAnalyzePage::jumpFromLabel(QLabel *label)
+{
+    if (label == m_advice) {
+        revealInReport(QStringLiteral("建议解决方案"));
+        return;
+    }
+    int index = m_shown.isEmpty() ? -1 : m_shown.size() - 1;
+    if (label == m_fault)
+        index = qMin(1, index);
+    else if (label == m_likely)
+        index = qMax(0, index);
+    if (index < 0)
+        return;
+    m_steps->setCurrentCell(index, 0);
+    focusStep(index);
+}
+
+void HighAnalyzePage::revealInReport(const QString &marker)
+{
+    if (!m_command || marker.isEmpty())
+        return;
+    const QTextCursor found = m_command->document()->find(marker);
+    if (found.isNull())
+        return;
+    m_command->setTextCursor(found);
+    m_command->ensureCursorVisible();
+}
+
+void HighAnalyzePage::findInReport()
+{
+    const QString key = m_findEdit->text();
+    if (key.isEmpty())
+        return;
+    QTextDocument *document = m_command->document();
+    QTextCursor found = document->find(key, m_command->textCursor());
+    if (found.isNull())
+        found = document->find(key);
+    if (found.isNull()) {
+        m_services.showStatus(StatusState::Info, QStringLiteral("说明里没有“%1”").arg(key));
+        return;
+    }
+    m_command->setTextCursor(found);
+    m_command->ensureCursorVisible();
+    m_command->setFocus();
+}
+
+void HighAnalyzePage::copyCurrentCommand()
+{
+    const int index = m_steps ? m_steps->currentRow() : -1;
+    QString text;
+    if (index >= 0 && index < m_shown.size() && !m_shown.at(index).commandLine.isEmpty())
+        text = m_shown.at(index).commandLine;
+    else if (m_detail)
+        text = m_detail->toPlainText();
+    if (text.isEmpty())
+        return;
+    QGuiApplication::clipboard()->setText(text);
+    m_services.showStatus(StatusState::Info, QStringLiteral("已复制"));
+}
+
+void HighAnalyzePage::showTextDialog(const QString &title, const QString &body)
+{
+    auto *dialog = new QDialog(this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setObjectName(QStringLiteral("textDialog"));
+    dialog->setWindowTitle(title.isEmpty() ? QStringLiteral("全文") : title);
+    dialog->resize(560, 420);
+    auto *layout = new QVBoxLayout(dialog);
+    auto *view = new QPlainTextEdit;
+    view->setObjectName(QStringLiteral("textDialogBody"));
+    view->setReadOnly(true);
+    view->setPlainText(body);
+    view->setAccessibleName(title);
+    layout->addWidget(view);
+    auto *buttons = new QHBoxLayout;
+    auto *copy = new QPushButton(QStringLiteral("复制"));
+    plainButton(copy);
+    copy->setObjectName(QStringLiteral("textDialogCopy"));
+    auto *close = new QPushButton(QStringLiteral("关闭"));
+    plainButton(close);
+    close->setObjectName(QStringLiteral("textDialogClose"));
+    buttons->addStretch(1);
+    buttons->addWidget(copy);
+    buttons->addWidget(close);
+    layout->addLayout(buttons);
+    connect(copy, &QPushButton::clicked, dialog, [view]() {
+        QGuiApplication::clipboard()->setText(view->toPlainText());
+    });
+    connect(close, &QPushButton::clicked, dialog, &QDialog::close);
+    dialog->show();
+}
+
+void HighAnalyzePage::setProgressText(const QString &text)
+{
+    m_progressFull = text;
+    const QString shown = m_progress->fontMetrics().elidedText(text, Qt::ElideRight, 180);
+    m_progress->setText(shown);
+    m_progress->setToolTip(text);
+}
+
+void HighAnalyzePage::ensurePanes()
+{
+    if (!m_vertical || !m_columns || !m_detailSplit || m_userSized)
+        return;
+    if (!isVisible() && m_vertical->height() < 40)
+        return;
+    m_adjusting = true;
+
+    const int colW = m_columns->width() > 0 ? m_columns->width() : qMax(0, width() - 16);
+    const int stepsW = qBound(200, colW * 30 / 100, 320);
+    if (colW > stepsW + 80)
+        m_columns->setSizes({stepsW, colW - stepsW});
+
+    const int rightW = qMax(0, colW - stepsW);
+    const int conclusionW = rightW * 66 / 100;
+    if (rightW > 80)
+        m_detailSplit->setSizes({conclusionW, rightW - conclusionW});
+
+    int textWidth = conclusionW - 128;
+    if (textWidth < 100)
+        textWidth = qMax(100, m_fault ? m_fault->width() : 100);
+
+    int content = 28;
+    QLabel *values[] = {m_fault, m_place, m_likely, m_advice};
+    for (QLabel *label : values) {
+        if (!label)
+            continue;
+        const int row = qMax(label->fontMetrics().lineSpacing() + 6, label->heightForWidth(textWidth));
+        label->setMinimumHeight(row);
+        content += row + 6;
+    }
+    content += 20;
+
+    const int total = m_vertical->height() > 0 ? m_vertical->height() : qMax(200, height() - 40);
+    const int handle = m_vertical->handleWidth();
+    const int bottomMin = 120;
+    int top = qMax(content, total * 58 / 100);
+    int bottom = total - handle - top;
+    if (bottom < bottomMin && total > bottomMin + handle + 80) {
+        bottom = bottomMin;
+        top = total - handle - bottom;
+    }
+    if (top < 80)
+        top = qMax(80, total - handle - bottomMin);
+    bottom = qMax(60, total - handle - top);
+    m_vertical->setSizes({top, bottom});
+    m_adjusting = false;
+}
+
+void HighAnalyzePage::onStepMenu(const QPoint &pos)
+{
+    auto *item = m_steps->itemAt(pos);
+    if (!item)
+        return;
+    m_steps->setCurrentCell(item->row(), 0);
+    QMenu menu(this);
+    menu.addAction(QStringLiteral("在说明中定位"), this, [this, item]() { focusStep(item->row()); });
+    menu.addAction(QStringLiteral("查看全文"), this, [this, item]() { openStepDialog(item->row()); });
+    menu.addAction(QStringLiteral("复制命令"), this, &HighAnalyzePage::copyCurrentCommand);
+    menu.exec(m_steps->viewport()->mapToGlobal(pos));
+}
+
 void HighAnalyzePage::start()
 {
     if (m_running)
@@ -392,6 +908,7 @@ void HighAnalyzePage::start()
         m_fault->setText(QStringLiteral("请先选择一个 core 文件。"));
         m_services.showStatus(StatusState::Error, QStringLiteral("请先选择 core 文件"));
         m_services.logWarning(QStringLiteral("未选择 core 文件"));
+        ensurePanes();
         return;
     }
     if (m_thread)
@@ -401,7 +918,7 @@ void HighAnalyzePage::start()
     m_lock = m_services.lockNavigation(QStringLiteral("正在分析 core 文件"));
     m_services.logInfo(QStringLiteral("开始分析 %1").arg(QFileInfo(core).fileName()));
     m_services.showStatus(StatusState::Busy, QStringLiteral("正在分析 core 文件"));
-    m_progress->setText(QStringLiteral("正在准备"));
+    setProgressText(QStringLiteral("正在准备"));
     refreshControls();
 
     TriageInput input;
@@ -422,7 +939,7 @@ void HighAnalyzePage::cancel()
         return;
     m_thread->askStop();
     m_stop->setEnabled(false);
-    m_progress->setText(QStringLiteral("正在取消"));
+    setProgressText(QStringLiteral("正在取消"));
     m_services.showStatus(StatusState::Busy, QStringLiteral("正在取消分析"));
 }
 
@@ -450,7 +967,7 @@ void HighAnalyzePage::onNote(const QString &text)
 {
     if (!m_running)
         return;
-    m_progress->setText(text);
+    setProgressText(text);
     m_services.showStatus(StatusState::Busy, text);
 }
 
@@ -476,6 +993,8 @@ void HighAnalyzePage::showOutcome(const TriageOutcome &outcome)
     m_advice->setText(outcome.advice.isEmpty() ? QStringLiteral("无") : outcome.advice);
     if (!outcome.document.isEmpty())
         m_command->setPlainText(outcome.document);
+    if (!outcome.steps.isEmpty())
+        showSteps(outcome.steps, {});
 
     const QString dir = dataDirectory();
     if (!dir.isEmpty() && !outcome.document.isEmpty()) {
@@ -483,15 +1002,16 @@ void HighAnalyzePage::showOutcome(const TriageOutcome &outcome)
         if (out.open(QIODevice::WriteOnly | QIODevice::Truncate))
             out.write(outcome.document.toUtf8());
     }
+    ensurePanes();
 
     if (outcome.stoppedEarly) {
-        m_progress->setText(QStringLiteral("已取消"));
+        setProgressText(QStringLiteral("已取消"));
         m_services.showStatus(StatusState::Info, QStringLiteral("已取消分析"));
         m_services.logWarning(QStringLiteral("分析已取消"));
         return;
     }
     if (outcome.accepted) {
-        m_progress->setText(QStringLiteral("分析完成"));
+        setProgressText(QStringLiteral("分析完成"));
         const QString brief = outcome.signalToken.isEmpty()
             ? QStringLiteral("分析完成")
             : QStringLiteral("分析完成：%1").arg(outcome.signalToken);
@@ -499,7 +1019,7 @@ void HighAnalyzePage::showOutcome(const TriageOutcome &outcome)
         m_services.logSuccess(brief);
         return;
     }
-    m_progress->setText(QStringLiteral("分析结束"));
+    setProgressText(QStringLiteral("分析结束"));
     m_services.showStatus(StatusState::Error, QStringLiteral("分析失败"));
     m_services.logError(outcome.fault);
 }
@@ -508,21 +1028,28 @@ void HighAnalyzePage::refreshControls()
 {
     const auto buttons = findChildren<QPushButton *>();
     for (QPushButton *button : buttons) {
-        if (button == m_stop)
+        const QString name = button->objectName();
+        if (name == QLatin1String("textDialogClose") || name == QLatin1String("textDialogCopy"))
+            button->setEnabled(true);
+        else if (button == m_stop)
             button->setEnabled(m_running);
         else if (button == m_save)
             button->setEnabled(!m_running && m_command && !m_command->toPlainText().isEmpty());
+        else if (button == m_copy)
+            button->setEnabled(m_detail && !m_detail->toPlainText().isEmpty());
         else
             button->setEnabled(!m_running);
     }
     m_coreEdit->setEnabled(!m_running);
     m_programEdit->setEnabled(!m_running);
     m_debugEdit->setEnabled(!m_running);
+    if (m_findEdit)
+        m_findEdit->setEnabled(true);
     if (m_running) {
         m_bar->setRange(0, 0);
     } else {
         m_bar->setRange(0, 1);
-        m_bar->setValue(m_progress->text() == QStringLiteral("分析完成") ? 1 : 0);
+        m_bar->setValue(m_progressFull == QStringLiteral("分析完成") ? 1 : 0);
     }
 }
 

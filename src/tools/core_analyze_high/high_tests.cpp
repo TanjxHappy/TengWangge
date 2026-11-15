@@ -6,16 +6,19 @@
 #include "shell/tool_registry.h"
 
 #include <QApplication>
+#include <QDialog>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QHash>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMouseEvent>
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QPushButton>
 #include <QStandardPaths>
+#include <QTableWidget>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QThread>
@@ -170,6 +173,37 @@ QString visibilityProblem(QWidget *widget, QWidget *window, int minHeight)
             .arg(mapped.height())
             .arg(window->width())
             .arg(window->height());
+    }
+    return {};
+}
+
+QString fullyShown(QWidget *widget, QWidget *window)
+{
+    const QString problem = visibilityProblem(widget, window, 12);
+    if (!problem.isEmpty())
+        return problem;
+    const QRect local = widget->rect();
+    const QPoint origin = widget->mapTo(window, local.topLeft());
+    const QRect mapped(origin, local.size());
+    if (!window->rect().contains(mapped)) {
+        return QStringLiteral("%1 矩形 %2,%3 %4x%5 未完整落在窗口 %6x%7 内")
+            .arg(widget->objectName())
+            .arg(mapped.x())
+            .arg(mapped.y())
+            .arg(mapped.width())
+            .arg(mapped.height())
+            .arg(window->width())
+            .arg(window->height());
+    }
+    if (auto *label = qobject_cast<QLabel *>(widget)) {
+        const int need = label->heightForWidth(qMax(1, label->width()));
+        if (label->height() + 4 < need) {
+            return QStringLiteral("%1 高度 %2 不足以显示全文（需要 %3，宽度 %4）")
+                .arg(label->objectName())
+                .arg(label->height())
+                .arg(need)
+                .arg(label->width());
+        }
     }
     return {};
 }
@@ -725,18 +759,36 @@ void HighAnalyzeTests::windowAt1180x760ShowsConclusionCommandsAndExport()
     auto *save = window.findChild<QPushButton *>(QStringLiteral("saveButton"));
     auto *conclusion = window.findChild<QLabel *>(QStringLiteral("conclusionTitle"));
     auto *fault = window.findChild<QLabel *>(QStringLiteral("faultLabel"));
+    auto *place = window.findChild<QLabel *>(QStringLiteral("placeLabel"));
+    auto *likely = window.findChild<QLabel *>(QStringLiteral("likelyLabel"));
+    auto *advice = window.findChild<QLabel *>(QStringLiteral("adviceLabel"));
     auto *commands = window.findChild<QPlainTextEdit *>(QStringLiteral("commandView"));
+    auto *detail = window.findChild<QPlainTextEdit *>(QStringLiteral("stepDetailView"));
+    auto *steps = window.findChild<QTableWidget *>(QStringLiteral("stepTable"));
+    auto *program = window.findChild<QLineEdit *>(QStringLiteral("programFileEdit"));
+    QVERIFY(program);
+    QVERIFY(!program->isVisible());
     QVERIFY2(visibilityProblem(save, &window, 16).isEmpty(),
              qPrintable(visibilityProblem(save, &window, 16)));
-    QVERIFY2(visibilityProblem(conclusion, &window, 12).isEmpty(),
-             qPrintable(visibilityProblem(conclusion, &window, 12)));
-    QVERIFY2(visibilityProblem(fault, &window, 12).isEmpty(),
-             qPrintable(visibilityProblem(fault, &window, 12)));
-    QVERIFY2(visibilityProblem(commands, &window, 24).isEmpty(),
-             qPrintable(visibilityProblem(commands, &window, 24)));
+    QVERIFY2(fullyShown(conclusion, &window).isEmpty(), qPrintable(fullyShown(conclusion, &window)));
+    QVERIFY2(fullyShown(fault, &window).isEmpty(), qPrintable(fullyShown(fault, &window)));
+    QVERIFY2(fullyShown(place, &window).isEmpty(), qPrintable(fullyShown(place, &window)));
+    QVERIFY2(fullyShown(likely, &window).isEmpty(), qPrintable(fullyShown(likely, &window)));
+    QVERIFY2(fullyShown(advice, &window).isEmpty(), qPrintable(fullyShown(advice, &window)));
+    QVERIFY2(visibilityProblem(commands, &window, 72).isEmpty(),
+             qPrintable(visibilityProblem(commands, &window, 72)));
+    QVERIFY2(visibilityProblem(detail, &window, 36).isEmpty(),
+             qPrintable(visibilityProblem(detail, &window, 36)));
+    QVERIFY2(visibilityProblem(steps, &window, 48).isEmpty(),
+             qPrintable(visibilityProblem(steps, &window, 48)));
     QVERIFY(commands->toPlainText().contains(QStringLiteral("分步操作")));
     QVERIFY(commands->toPlainText().contains(QStringLiteral("中文释义")));
-    shot(&window, QStringLiteral("core-analyze-high-window"));
+    QCOMPARE(steps->rowCount(), 4);
+    steps->setCurrentCell(1, 0);
+    QApplication::processEvents();
+    QVERIFY(commands->textCursor().selectedText().contains(QStringLiteral("读取停止信号")));
+    QVERIFY(detail->toPlainText().contains(QStringLiteral("读取停止信号")));
+    shot(&window, QStringLiteral("core-analyze-high-layout"));
 
     const QString path = writeBytes(dir.filePath(QStringLiteral("demo.core")), elfHeader(4));
     page->setLocatorForTest(presentTools());
@@ -752,14 +804,66 @@ void HighAnalyzeTests::windowAt1180x760ShowsConclusionCommandsAndExport()
     QApplication::processEvents();
     QVERIFY2(visibilityProblem(save, &window, 16).isEmpty(),
              qPrintable(visibilityProblem(save, &window, 16)));
-    QVERIFY2(visibilityProblem(conclusion, &window, 12).isEmpty(),
-             qPrintable(visibilityProblem(conclusion, &window, 12)));
-    QVERIFY2(visibilityProblem(fault, &window, 12).isEmpty(),
-             qPrintable(visibilityProblem(fault, &window, 12)));
-    QVERIFY2(visibilityProblem(commands, &window, 24).isEmpty(),
-             qPrintable(visibilityProblem(commands, &window, 24)));
+    QVERIFY2(fullyShown(fault, &window).isEmpty(), qPrintable(fullyShown(fault, &window)));
+    QVERIFY2(fullyShown(place, &window).isEmpty(), qPrintable(fullyShown(place, &window)));
+    QVERIFY2(fullyShown(likely, &window).isEmpty(), qPrintable(fullyShown(likely, &window)));
+    QVERIFY2(fullyShown(advice, &window).isEmpty(), qPrintable(fullyShown(advice, &window)));
+    QVERIFY2(visibilityProblem(commands, &window, 72).isEmpty(),
+             qPrintable(visibilityProblem(commands, &window, 72)));
     QVERIFY(commands->toPlainText().contains(QStringLiteral("thread apply all bt")));
-    shot(&window, QStringLiteral("core-analyze-high-window-result"));
+    QVERIFY(advice->text().contains(QStringLiteral("不要删除")));
+
+    steps->setCurrentCell(3, 0);
+    QApplication::processEvents();
+    QVERIFY(commands->textCursor().selectedText().contains(QStringLiteral("查看停在哪一步")));
+    QVERIFY(detail->toPlainText().contains(QStringLiteral("thread apply all bt")));
+
+    QTest::mouseClick(advice, Qt::LeftButton);
+    QApplication::processEvents();
+    QVERIFY(commands->textCursor().selectedText().contains(QStringLiteral("建议解决方案")));
+
+    const QModelIndex stepIndex = steps->model()->index(0, 0);
+    steps->scrollTo(stepIndex);
+    QApplication::processEvents();
+    const QRect cell = steps->visualRect(stepIndex);
+    QVERIFY2(cell.isValid() && steps->viewport()->rect().contains(cell.center()),
+             qPrintable(QStringLiteral("步骤格 %1,%2 %3x%4，视口 %5x%6")
+                            .arg(cell.x())
+                            .arg(cell.y())
+                            .arg(cell.width())
+                            .arg(cell.height())
+                            .arg(steps->viewport()->width())
+                            .arg(steps->viewport()->height())));
+    QTest::mouseClick(steps->viewport(), Qt::LeftButton, Qt::NoModifier, cell.center());
+    QCOMPARE(steps->currentRow(), 0);
+    // 离屏平台不会把两次点击稳定合成双击，这里把视图会收到的双击事件直接送进去。
+    QMouseEvent stepDoubleClick(QEvent::MouseButtonDblClick, cell.center(),
+                                steps->viewport()->mapToGlobal(cell.center()), Qt::LeftButton,
+                                Qt::LeftButton, Qt::NoModifier);
+    QVERIFY(QApplication::sendEvent(steps->viewport(), &stepDoubleClick));
+    QApplication::processEvents();
+    auto *dialog = window.findChild<QDialog *>(QStringLiteral("textDialog"));
+    QVERIFY(dialog);
+    QVERIFY(dialog->isVisible());
+    auto *body = dialog->findChild<QPlainTextEdit *>(QStringLiteral("textDialogBody"));
+    QVERIFY(body);
+    QVERIFY(body->toPlainText().contains(QStringLiteral("辨认这是不是 core 文件")));
+    dialog->close();
+    QApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+
+    const QPoint faultPos = fault->rect().center();
+    QMouseEvent faultDoubleClick(QEvent::MouseButtonDblClick, faultPos, fault->mapToGlobal(faultPos),
+                                 Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QVERIFY(QApplication::sendEvent(fault, &faultDoubleClick));
+    QApplication::processEvents();
+    auto *valueDialog = window.findChild<QDialog *>(QStringLiteral("textDialog"));
+    QVERIFY(valueDialog);
+    QVERIFY(valueDialog->isVisible());
+    auto *valueBody = valueDialog->findChild<QPlainTextEdit *>(QStringLiteral("textDialogBody"));
+    QVERIFY(valueBody->toPlainText().contains(QStringLiteral("不允许访问的内存")));
+    valueDialog->close();
+    QApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+    shot(&window, QStringLiteral("core-analyze-high-layout-result"));
 }
 
 void HighAnalyzeTests::realCoreSampleWhenEnvironmentAllows()

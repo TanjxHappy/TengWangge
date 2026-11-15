@@ -11,11 +11,14 @@
 #include <functional>
 #include <memory>
 
+class QDialog;
 class QLabel;
 class QLineEdit;
 class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
+class QSplitter;
+class QTableWidget;
 
 namespace tw {
 
@@ -62,6 +65,11 @@ public:
     // 把当前说明写成 UTF-8 文本（不带 BOM）。
     bool saveReport(const QString &path, QString *error = nullptr) const;
 
+protected:
+    void showEvent(QShowEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
+
 private:
     void browseFile(QLineEdit *edit, const QString &title);
     void browseDebugDirectory();
@@ -75,6 +83,20 @@ private:
     void onFinished();
     void showOutcome(const TriageOutcome &outcome);
     void refreshControls();
+    void openConditions();
+    void showSteps(const QVector<TriageStep> &steps, const QStringList &markers);
+    void fillPreviewSteps();
+    void focusStep(int index);
+    void openStepDialog(int index);
+    void openValueDialog(QLabel *label);
+    void jumpFromLabel(QLabel *label);
+    void revealInReport(const QString &marker);
+    void findInReport();
+    void copyCurrentCommand();
+    void showTextDialog(const QString &title, const QString &body);
+    void setProgressText(const QString &text);
+    void ensurePanes();
+    void onStepMenu(const QPoint &pos);
 
     ToolServices m_services;
     QPointer<QWidget> m_dialogParent;
@@ -84,13 +106,17 @@ private:
     QPointer<TriageThread> m_thread;
     bool m_running = false;
     bool m_closing = false;
+    bool m_adjusting = false;
+    bool m_userSized = false;
 
     QLineEdit *m_coreEdit = nullptr;
     QLineEdit *m_programEdit = nullptr;
     QLineEdit *m_debugEdit = nullptr;
+    QLineEdit *m_findEdit = nullptr;
     QPushButton *m_run = nullptr;
     QPushButton *m_stop = nullptr;
     QPushButton *m_save = nullptr;
+    QPushButton *m_copy = nullptr;
     QProgressBar *m_bar = nullptr;
     QLabel *m_progress = nullptr;
     QLabel *m_fault = nullptr;
@@ -98,6 +124,15 @@ private:
     QLabel *m_likely = nullptr;
     QLabel *m_advice = nullptr;
     QPlainTextEdit *m_command = nullptr;
+    QPlainTextEdit *m_detail = nullptr;
+    QTableWidget *m_steps = nullptr;
+    QSplitter *m_vertical = nullptr;
+    QSplitter *m_columns = nullptr;
+    QSplitter *m_detailSplit = nullptr;
+    QDialog *m_conditions = nullptr;
+    QVector<TriageStep> m_shown;
+    QStringList m_markers;
+    QString m_progressFull;
 };
 
 class HighAnalyzeTool : public ITool
