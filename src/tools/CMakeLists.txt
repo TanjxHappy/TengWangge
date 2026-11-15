@@ -15,6 +15,7 @@ endfunction()
 add_subdirectory(welcome)
 add_subdirectory(task_demo)
 add_subdirectory(sysinfo)
+add_subdirectory(core_analyze)
 
 get_property(_tw_tool_targets GLOBAL PROPERTY TW_TOOL_TARGETS)
 add_library(tengwangge_builtin_tools STATIC builtin_tools.cpp builtin_tools.h)
