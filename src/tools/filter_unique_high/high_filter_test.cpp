@@ -13,6 +13,7 @@
 #include <QComboBox>
 #include <QDir>
 #include <QFile>
+#include <QHeaderView>
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -21,8 +22,11 @@
 #include <QListWidget>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QPixmap>
+#include <QSplitter>
 #include <QTableView>
 #include <QTemporaryDir>
+#include <QTreeView>
 #include <QVBoxLayout>
 #include <QtTest>
 
@@ -459,6 +463,51 @@ void HighFilterTests::pageSummarizesFuzzyMatchAndSearch()
     mode->setCurrentIndex(0);
     QCOMPARE(table->model()->rowCount(), 5);
 
+    const int keepAgain = rowWithPath(table, QStringLiteral("keep.txt"));
+    QVERIFY(keepAgain >= 0);
+    table->selectRow(keepAgain);
+    QApplication::processEvents();
+    auto *tree = env.page->findChild<QTreeView *>(QStringLiteral("highFilter.tree"));
+    auto *focus = env.page->findChild<tw::ElidedLabel *>(QStringLiteral("highFilter.focusPath"));
+    QVERIFY(tree && focus);
+    QVERIFY(tree->model()->rowCount() > 0);
+    QCOMPARE(focus->fullText(), QStringLiteral("keep.txt"));
+    QVERIFY(tree->currentIndex().isValid());
+    const QString treeText = tree->model()->data(tree->currentIndex().sibling(tree->currentIndex().row(), 0)).toString();
+    QCOMPARE(treeText, QStringLiteral("keep.txt"));
+
+    table->horizontalHeader()->setSortIndicator(0, Qt::DescendingOrder);
+    table->model()->sort(0, Qt::DescendingOrder);
+    QCOMPARE(table->model()->rowCount(), 5);
+    QVERIFY(rowWithPath(table, QStringLiteral("资料/说明.txt")) >= 0);
+
+    auto *detailButton = env.page->findChild<QPushButton *>(QStringLiteral("highFilter.showDetail"));
+    auto *fileDialog = env.page->findChild<QWidget *>(QStringLiteral("highFilter.fileDialog"));
+    QVERIFY(detailButton && fileDialog);
+    QVERIFY(fileDialog->isHidden());
+    detailButton->click();
+    QVERIFY(QTest::qWaitForWindowExposed(fileDialog));
+    QVERIFY(!fileDialog->isHidden());
+    QVERIFY(env.page->findChild<QLabel *>(QStringLiteral("highFilter.dialogPath"))
+                ->text()
+                .endsWith(QStringLiteral("keep.txt")));
+    fileDialog->hide();
+
+    QModelIndex notesIndex;
+    for (int row = 0; row < tree->model()->rowCount(); ++row) {
+        const QModelIndex index = tree->model()->index(row, 0);
+        if (index.data(Qt::UserRole).toString() == QStringLiteral("notes"))
+            notesIndex = index;
+    }
+    QVERIFY(notesIndex.isValid());
+    QVERIFY(QMetaObject::invokeMethod(env.page, "onTreeDoubleClicked", Q_ARG(QModelIndex, notesIndex)));
+    QCOMPARE(table->model()->rowCount(), 1);
+    QCOMPARE(cellText(table, 0, 0), QStringLiteral("notes/my_report_2024.md"));
+    auto *scopeReset = env.page->findChild<QPushButton *>(QStringLiteral("highFilter.scopeReset"));
+    QVERIFY(scopeReset && scopeReset->isVisible());
+    scopeReset->click();
+    QCOMPARE(table->model()->rowCount(), 5);
+
     QVERIFY(QFileInfo::exists(root + QStringLiteral("/Report_2024.TXT")));
     QVERIFY(QFileInfo::exists(root + QStringLiteral("/keep.txt")));
     QVERIFY(QFileInfo(root).isDir());
@@ -758,25 +807,84 @@ void HighFilterTests::resultTableStaysVisibleInTypicalWindow()
     QVERIFY(sawTitle);
 
     auto *table = page->findChild<QTableView *>(QStringLiteral("highFilter.results"));
+    auto *tree = page->findChild<QTreeView *>(QStringLiteral("highFilter.tree"));
+    auto *issues = page->findChild<QTableView *>(QStringLiteral("highFilter.issues"));
+    auto *detail = page->findChild<QWidget *>(QStringLiteral("highFilter.detailPane"));
     auto *terms = page->findChild<QPlainTextEdit *>(QStringLiteral("highFilter.terms"));
     auto *rule = page->findChild<tw::ElidedLabel *>(QStringLiteral("highFilter.rule"));
-    QVERIFY(table && terms && rule);
+    auto *workSplit = page->findChild<QSplitter *>(QStringLiteral("highFilter.workSplit"));
+    QVERIFY(table && tree && issues && detail && terms && rule && workSplit);
     QApplication::processEvents();
 
-    QVERIFY(table->isVisibleTo(&window));
+    auto overlap = [&window](QWidget *widget) -> QString {
+        if (!widget->isVisibleTo(&window))
+            return widget->objectName() + QStringLiteral(" 不可见");
+        const QPoint origin = widget->mapTo(&window, QPoint(0, 0));
+        if (origin.y() < 48)
+            return QStringLiteral("%1 y=%2").arg(widget->objectName()).arg(origin.y());
+        if (origin.y() + widget->height() > window.height() - 28)
+            return QStringLiteral("%1 y=%2 h=%3 window=%4")
+                .arg(widget->objectName())
+                .arg(origin.y())
+                .arg(widget->height())
+                .arg(window.height());
+        if (origin.x() < 196 || origin.x() + widget->width() > window.width())
+            return QStringLiteral("%1 x=%2 w=%3").arg(widget->objectName()).arg(origin.x()).arg(widget->width());
+        return {};
+    };
+    QVERIFY2(overlap(table).isEmpty(), qPrintable(overlap(table)));
+    QVERIFY2(overlap(tree).isEmpty(), qPrintable(overlap(tree)));
+    QVERIFY2(overlap(issues).isEmpty(), qPrintable(overlap(issues)));
+    QVERIFY2(overlap(detail).isEmpty(), qPrintable(overlap(detail)));
+
     QVERIFY2(table->height() >= 160, qPrintable(QString::number(table->height())));
-    QVERIFY(table->height() > terms->height() * 2);
     QVERIFY(table->width() >= 480);
+    QVERIFY(tree->height() >= 160);
+    QVERIFY(issues->height() >= 48);
     const QPoint origin = table->mapTo(&window, QPoint(0, 0));
-    QVERIFY2(origin.y() > 70, qPrintable(QString::number(origin.y())));
-    QVERIFY2(origin.y() + table->height() <= window.height() - 28,
-             qPrintable(QStringLiteral("y=%1 h=%2 window=%3")
-                            .arg(origin.y())
-                            .arg(table->height())
-                            .arg(window.height())));
+    const QPoint treePos = tree->mapTo(&window, QPoint(0, 0));
+    const QPoint detailPos = detail->mapTo(&window, QPoint(0, 0));
+    const QPoint issuePos = issues->mapTo(&window, QPoint(0, 0));
+    QVERIFY(treePos.x() < origin.x());
+    QVERIFY(detailPos.x() >= origin.x() + table->width() - 4);
+    QVERIFY(issuePos.y() >= origin.y() + table->height() - 4);
     QVERIFY(rule->sizeHint().height() <= rule->fontMetrics().height() + 8);
     const QPoint rulePos = rule->mapTo(&window, QPoint(0, 0));
     QVERIFY(rulePos.y() + rule->height() <= origin.y() + 2);
+    QVERIFY(workSplit->orientation() == Qt::Horizontal);
+    QCOMPARE(workSplit->count(), 3);
+
+    const QPixmap emptyShot = window.grab();
+    emptyShot.save(QStringLiteral("/tmp/filter-unique-high-empty-1180x760.png"));
+    QDir().mkpath(QStringLiteral("/opt/cursor/artifacts"));
+    emptyShot.save(QStringLiteral("/opt/cursor/artifacts/filter-unique-high-empty-1180x760.png"));
+
+    const QString root = dir.filePath(QStringLiteral("scan"));
+    QVERIFY(writeFile(root + QStringLiteral("/Report_2024.TXT")).isEmpty());
+    QVERIFY(writeFile(root + QStringLiteral("/notes/my_report_2024.md")).isEmpty());
+    QVERIFY(writeFile(root + QStringLiteral("/资料/说明.txt")).isEmpty());
+    QVERIFY(writeFile(root + QStringLiteral("/keep.txt")).isEmpty());
+    page->findChild<QPlainTextEdit *>(QStringLiteral("highFilter.terms"))
+        ->setPlainText(QStringLiteral("report_2024\n说明"));
+    page->findChild<QLineEdit *>(QStringLiteral("highFilter.directory"))->setText(root);
+    page->findChild<QPushButton *>(QStringLiteral("highFilter.start"))->click();
+    auto *board = qobject_cast<tw::HighFilterPage *>(page);
+    QVERIFY(board);
+    QTRY_VERIFY_WITH_TIMEOUT(!board->isBusy(), 8000);
+    const int nested = rowWithPath(table, QStringLiteral("notes/my_report_2024.md"));
+    QVERIFY(nested >= 0);
+    table->selectRow(nested);
+    QApplication::processEvents();
+    QVERIFY2(overlap(table).isEmpty(), qPrintable(overlap(table)));
+    QVERIFY2(overlap(tree).isEmpty(), qPrintable(overlap(tree)));
+    QVERIFY2(overlap(issues).isEmpty(), qPrintable(overlap(issues)));
+    QVERIFY(table->height() >= 160);
+    QVERIFY(table->width() >= 480);
+    QVERIFY(tree->model()->rowCount() > 0);
+
+    const QPixmap scannedShot = window.grab();
+    scannedShot.save(QStringLiteral("/tmp/filter-unique-high-scanned-1180x760.png"));
+    scannedShot.save(QStringLiteral("/opt/cursor/artifacts/filter-unique-high-scanned-1180x760.png"));
 }
 
 QTEST_MAIN(HighFilterTests)

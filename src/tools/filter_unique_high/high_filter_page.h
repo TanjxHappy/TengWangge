@@ -3,6 +3,8 @@
 #include "core/platform_services.h"
 #include "shell/i_tool.h"
 
+#include <QHash>
+#include <QModelIndex>
 #include <QPointer>
 #include <QStringList>
 #include <QWidget>
@@ -10,15 +12,20 @@
 #include <memory>
 
 class QComboBox;
+class QDialog;
 class QLabel;
 class QLineEdit;
 class QListWidget;
 class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
-class QStackedWidget;
+class QResizeEvent;
+class QSplitter;
+class QStandardItem;
+class QStandardItemModel;
 class QTableView;
 class QThread;
+class QTreeView;
 
 namespace tw {
 
@@ -27,6 +34,7 @@ class HitModel;
 class HitProxy;
 class IssueModel;
 struct Job;
+struct ListedFile;
 struct RemovalBatch;
 struct TreeWalk;
 
@@ -78,6 +86,24 @@ private:
     void setStage(Stage stage);
     void showPace(int files, int issues);
     void showRemovalPace(int done, int total);
+    void editTerms();
+    void rebuildTree();
+    void applyScope(const QString &scope);
+    void onTableSelectionChanged();
+    void onTreeSelectionChanged();
+    Q_INVOKABLE void onTreeDoubleClicked(const QModelIndex &index);
+    void onIssueActivated(const QModelIndex &index);
+    void showFocus(const ListedFile *file);
+    void openFocusDialog();
+    void openFocusedFile();
+    void locateFocusedFile();
+    void selectRelative(const QString &relative, bool revealTree);
+    const ListedFile *fileByRelative(const QString &relative) const;
+    const ListedFile *fileByAbsolute(const QString &absolute) const;
+    void applySplitSizes();
+
+protected:
+    void resizeEvent(QResizeEvent *event) override;
 
     ToolServices m_services;
     QString m_dataDir;
@@ -92,12 +118,18 @@ private:
     bool m_loading = false;
     Stage m_stage = Stage::Hidden;
     bool m_previewMatched = true;
+    bool m_linking = false;
+    bool m_splitReady = false;
+    QString m_scope;
+    QString m_focusRelative;
     QStringList m_pending;
     int m_matched = 0;
     int m_unmatched = 0;
     int m_issueCount = 0;
 
     QPlainTextEdit *m_terms = nullptr;
+    QDialog *m_termsDialog = nullptr;
+    QPushButton *m_termsButton = nullptr;
     QLabel *m_termCount = nullptr;
     QPushButton *m_import = nullptr;
     QLineEdit *m_directory = nullptr;
@@ -114,13 +146,29 @@ private:
     QLineEdit *m_search = nullptr;
     QComboBox *m_viewMode = nullptr;
     QLabel *m_visibleCount = nullptr;
+    QSplitter *m_mainSplit = nullptr;
+    QSplitter *m_workSplit = nullptr;
+    QTreeView *m_tree = nullptr;
+    QStandardItemModel *m_treeModel = nullptr;
+    QHash<QString, QStandardItem *> m_fileNodes;
     QTableView *m_results = nullptr;
     QTableView *m_issues = nullptr;
     HitModel *m_files = nullptr;
     HitProxy *m_proxy = nullptr;
     IssueModel *m_issueModel = nullptr;
-    QStackedWidget *m_stack = nullptr;
-    QWidget *m_preview = nullptr;
+    QDialog *m_preview = nullptr;
+    QDialog *m_fileDialog = nullptr;
+    ElidedLabel *m_focusPath = nullptr;
+    QLabel *m_focusState = nullptr;
+    ElidedLabel *m_focusHits = nullptr;
+    ElidedLabel *m_scopeLabel = nullptr;
+    QPushButton *m_scopeReset = nullptr;
+    QPushButton *m_openFile = nullptr;
+    QPushButton *m_showDetail = nullptr;
+    QPushButton *m_locate = nullptr;
+    QLabel *m_dialogPath = nullptr;
+    QLabel *m_dialogState = nullptr;
+    QLabel *m_dialogHits = nullptr;
     QLabel *m_previewTitle = nullptr;
     QLabel *m_previewHint = nullptr;
     QListWidget *m_previewList = nullptr;
