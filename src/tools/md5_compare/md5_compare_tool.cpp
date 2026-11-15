@@ -24,6 +24,8 @@
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QPushButton>
+#include <QScrollArea>
+#include <QShowEvent>
 #include <QSettings>
 #include <QTableView>
 #include <QThread>
@@ -62,11 +64,55 @@ QString formatProblems(const CompareResult &result)
     return lines.join(QLatin1Char('\n'));
 }
 
-QLabel *makeLabel(const QString &text, const char *role)
+// 普通 QScrollArea 在 widgetResizable 下不会小于子控件的 sizeHint。
+// 表格和问题框的 sizeHint 很高，窗口里就会只剩滚动条、把下半截推出画面。
+// 这里按最小高度撑开：放得下就铺满视口，放不下再滚动，输入框不会被压成 0。
+class FittingScroll : public QScrollArea
+{
+public:
+    explicit FittingScroll(QWidget *parent = nullptr)
+        : QScrollArea(parent)
+    {
+        setWidgetResizable(false);
+        setFrameShape(QFrame::NoFrame);
+        setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+        setAutoFillBackground(false);
+    }
+
+protected:
+    void resizeEvent(QResizeEvent *event) override
+    {
+        QScrollArea::resizeEvent(event);
+        fit();
+    }
+
+    void showEvent(QShowEvent *event) override
+    {
+        QScrollArea::showEvent(event);
+        fit();
+    }
+
+private:
+    void fit()
+    {
+        QWidget *child = widget();
+        if (!child || viewport() == nullptr)
+            return;
+        const QSize minimum = child->minimumSizeHint();
+        const QSize target(qMax(minimum.width(), viewport()->width()),
+                           qMax(minimum.height(), viewport()->height()));
+        if (child->size() != target)
+            child->resize(target);
+    }
+};
+
+QLabel *makeLabel(const QString &text, const char *role, bool wrap = true)
 {
     auto *label = new QLabel(text);
     label->setProperty("role", QString::fromLatin1(role));
-    label->setWordWrap(true);
+    label->setWordWrap(wrap);
+    if (!wrap)
+        label->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
     return label;
 }
 
@@ -242,13 +288,44 @@ private:
     QString m_error;
 };
 
+class ExportThread : public QThread
+{
+public:
+    ExportThread(QString path, CompareResult result, std::atomic<bool> *cancel)
+        : m_path(std::move(path))
+        , m_result(std::move(result))
+        , m_cancelRequested(cancel)
+    {
+    }
+
+    bool ok() const { return m_ok; }
+    QString error() const { return m_error; }
+
+protected:
+    void run() override
+    {
+        const auto shouldCancel = [this]() {
+            return m_cancelRequested != nullptr && m_cancelRequested->load(std::memory_order_acquire);
+        };
+        m_ok = writeCompareReport(m_path, m_result, &m_error, shouldCancel);
+    }
+
+private:
+    QString m_path;
+    CompareResult m_result;
+    std::atomic<bool> *m_cancelRequested = nullptr;
+    bool m_ok = false;
+    QString m_error;
+};
+
 Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     : QWidget(parent)
     , m_services(services)
 {
     setAccessibleName(QStringLiteral("目录 MD5 比较"));
 
-    auto *layout = new QVBoxLayout(this);
+    auto *body = new QWidget;
+    auto *layout = new QVBoxLayout(body);
     layout->setContentsMargins(28, 24, 28, 24);
     layout->setSpacing(14);
 
@@ -267,8 +344,8 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     grid->setVerticalSpacing(10);
     grid->setColumnStretch(1, 1);
 
-    auto *labelA = makeLabel(QStringLiteral("目录 A"), "fieldLabel");
-    auto *labelB = makeLabel(QStringLiteral("目录 B"), "fieldLabel");
+    auto *labelA = makeLabel(QStringLiteral("目录 A"), "fieldLabel", false);
+    auto *labelB = makeLabel(QStringLiteral("目录 B"), "fieldLabel", false);
     m_dirA = new QLineEdit;
     m_dirB = new QLineEdit;
     m_dirA->setObjectName(QStringLiteral("md5DirA"));
@@ -283,6 +360,9 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_dirB->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     m_dirA->setMinimumWidth(0);
     m_dirB->setMinimumWidth(0);
+    const int editHeight = qMax(1, m_dirA->sizeHint().height());
+    m_dirA->setMinimumHeight(editHeight);
+    m_dirB->setMinimumHeight(editHeight);
     labelA->setBuddy(m_dirA);
     labelB->setBuddy(m_dirB);
 
@@ -344,10 +424,8 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_state->setFullText(QStringLiteral("尚未比较"));
     grid->addWidget(m_state, 4, 0, 1, 3);
 
-    grid->addWidget(makeLabel(
-                        QStringLiteral("比较在后台进行。进行中不能切换工具或页面。"
-                                       "不会修改这两个目录；上次使用的路径只写在本工具自己的数据目录里。"),
-                        "hint"),
+    grid->addWidget(makeLabel(QStringLiteral("不会修改这两个目录。上次使用的路径只写在本工具自己的数据里。"),
+                              "hint"),
                     5, 0, 1, 3);
     layout->addWidget(card);
 
@@ -357,8 +435,8 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
 
     auto *filters = new QHBoxLayout;
     filters->setSpacing(8);
-    auto *filterLabel = makeLabel(QStringLiteral("状态"), "fieldLabel");
-    auto *searchLabel = makeLabel(QStringLiteral("路径"), "fieldLabel");
+    auto *filterLabel = makeLabel(QStringLiteral("状态"), "fieldLabel", false);
+    auto *searchLabel = makeLabel(QStringLiteral("路径"), "fieldLabel", false);
     m_filter = new QComboBox;
     m_search = new QLineEdit;
     m_filter->setObjectName(QStringLiteral("md5Filter"));
@@ -367,8 +445,11 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_search->setAccessibleName(QStringLiteral("按路径搜索"));
     m_search->setPlaceholderText(QStringLiteral("输入相对路径的一部分"));
     m_search->setClearButtonEnabled(true);
-    m_search->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    m_search->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     m_search->setMinimumWidth(0);
+    m_filter->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
+    m_filter->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    m_filter->setMinimumContentsLength(6);
     filterLabel->setBuddy(m_filter);
     searchLabel->setBuddy(m_search);
     m_filter->addItem(QStringLiteral("全部"), -1);
@@ -404,15 +485,20 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_table->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
     m_table->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     m_table->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
-    m_table->setMinimumSize(0, 0);
+    const int textHeight = qMax(1, m_table->fontMetrics().height());
+    const int headerHeight = qMax(textHeight, m_table->horizontalHeader()->sizeHint().height());
+    m_table->setMinimumHeight(headerHeight + textHeight * 2);
     m_table->verticalHeader()->setVisible(false);
     m_table->horizontalHeader()->setStretchLastSection(true);
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
     m_table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
     m_table->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Stretch);
-    const int columnFloor = qMax(1, m_table->fontMetrics().horizontalAdvance(QStringLiteral("状态")));
+    m_table->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Stretch);
+    const int columnFloor = qMax(1, m_table->fontMetrics().horizontalAdvance(QStringLiteral("MD5")));
     m_table->horizontalHeader()->setMinimumSectionSize(columnFloor);
+    const int statusWidth = m_table->fontMetrics().horizontalAdvance(QStringLiteral("仅在目录 B")) + 28;
+    m_table->setColumnWidth(1, statusWidth);
     layout->addWidget(m_table, 3);
 
     layout->addWidget(makeLabel(QStringLiteral("问题"), "sectionTitle"));
@@ -422,9 +508,17 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_problems->setReadOnly(true);
     m_problems->setPlaceholderText(QStringLiteral("没有问题"));
     m_problems->setLineWrapMode(QPlainTextEdit::WidgetWidth);
-    m_problems->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    m_problems->setMinimumSize(0, 0);
+    m_problems->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Ignored);
+    m_problems->setMinimumHeight(m_problems->fontMetrics().height() * 2 + 8);
     layout->addWidget(m_problems, 1);
+
+    auto *scroll = new FittingScroll;
+    scroll->setObjectName(QStringLiteral("md5Scroll"));
+    scroll->setWidget(body);
+    scroll->viewport()->setAutoFillBackground(false);
+    auto *outer = new QVBoxLayout(this);
+    outer->setContentsMargins(0, 0, 0, 0);
+    outer->addWidget(scroll);
 
     connect(m_browseA, &QPushButton::clicked, this, [this]() {
         browse(m_dirA, QStringLiteral("选择目录 A"));
@@ -466,15 +560,25 @@ Md5ComparePage::~Md5ComparePage()
 
 void Md5ComparePage::abort()
 {
-    if (!m_thread)
-        return;
     m_cancelRequested.store(true, std::memory_order_release);
-    CompareThread *thread = m_thread;
+    CompareThread *compare = m_thread;
+    ExportThread *exporter = m_exportThread;
     m_thread = nullptr;
-    disconnect(thread, nullptr, this, nullptr);
-    QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
-    thread->wait();
-    delete thread;
+    m_exportThread = nullptr;
+    if (compare)
+        disconnect(compare, nullptr, this, nullptr);
+    if (exporter)
+        disconnect(exporter, nullptr, this, nullptr);
+    if (compare || exporter)
+        QCoreApplication::removePostedEvents(this, QEvent::MetaCall);
+    if (compare) {
+        compare->wait();
+        delete compare;
+    }
+    if (exporter) {
+        exporter->wait();
+        delete exporter;
+    }
     m_running = false;
     m_lock.release();
 }
@@ -523,14 +627,18 @@ void Md5ComparePage::startCompare()
     }
 
     saveState();
+    m_activeA = dirA;
+    m_activeB = dirB;
     m_hasResult = false;
+    m_comparedA.clear();
+    m_comparedB.clear();
     m_result = {};
     m_model->setEntries({});
     m_problems->clear();
     m_counts->setText(emptyCounts());
     applyFilter();
     m_bar->setRange(0, 0);
-    m_state->setFullText(QStringLiteral("正在比较…"));
+    m_state->setFullText(QStringLiteral("正在列出文件…"));
     m_services.logInfo(QStringLiteral("开始比较：%1 与 %2").arg(dirA, dirB));
     m_services.showStatus(StatusState::Busy, QStringLiteral("正在比较目录"));
 
@@ -576,37 +684,49 @@ void Md5ComparePage::exportReport()
     const QString path = dialog.selectedFiles().value(0);
     if (path.isEmpty())
         return;
+    exportTo(path);
+}
 
-    const QString blocked = compareReportBlockReason(m_dirA->text(), m_dirB->text(), path);
+void Md5ComparePage::exportTo(const QString &path)
+{
+    if (!m_hasResult || m_running)
+        return;
+    const QString dirA = m_comparedA.isEmpty() ? m_dirA->text() : m_comparedA;
+    const QString dirB = m_comparedB.isEmpty() ? m_dirB->text() : m_comparedB;
+    const QString blocked = compareReportBlockReason(dirA, dirB, path);
     if (!blocked.isEmpty()) {
         showFailure(blocked);
         return;
     }
-    QString writeError;
-    if (!writeCompareReport(path, m_result, &writeError)) {
-        showFailure(writeError.isEmpty() ? QStringLiteral("无法写入报告") : writeError);
-        return;
-    }
-    m_state->setFullText(QStringLiteral("已导出报告"));
-    m_services.logSuccess(QStringLiteral("已导出报告：%1").arg(path));
-    m_services.showStatus(StatusState::Success, QStringLiteral("已导出报告"));
+
+    m_cancelRequested.store(false, std::memory_order_release);
+    m_exportThread = new ExportThread(path, m_result, &m_cancelRequested);
+    m_exportThread->setObjectName(QStringLiteral("md5-export"));
+    connect(m_exportThread, &QThread::finished, this, &Md5ComparePage::onExportFinished, Qt::QueuedConnection);
+    m_running = true;
+    m_bar->setRange(0, 0);
+    m_state->setFullText(QStringLiteral("正在导出报告…"));
+    m_services.showStatus(StatusState::Busy, QStringLiteral("正在导出报告"));
+    m_lock = m_services.lockNavigation(QStringLiteral("正在导出比较报告"));
+    updateActions();
+    m_exportThread->start();
 }
 
 void Md5ComparePage::onProgress(bool enumerating, int completed, int total, const QString &path)
 {
     if (!m_running)
         return;
-    QString text;
     if (enumerating || total <= 0) {
         m_bar->setRange(0, 0);
-        text = path.isEmpty() ? QStringLiteral("正在枚举文件…") : QStringLiteral("正在枚举：%1").arg(path);
-    } else {
-        m_bar->setRange(0, total);
-        m_bar->setValue(completed);
-        text = QStringLiteral("正在计算 MD5（%1/%2） %3").arg(completed).arg(total).arg(path);
+        const QString where = path.isEmpty() ? QString() : QStringLiteral("：%1").arg(path);
+        m_state->setFullText(QStringLiteral("正在列出文件，已找到 %1 个%2").arg(completed).arg(where));
+        m_services.showStatus(StatusState::Busy, QStringLiteral("正在列出文件"));
+        return;
     }
-    m_state->setFullText(text);
-    m_services.showStatus(StatusState::Busy, text);
+    m_bar->setRange(0, total);
+    m_bar->setValue(qBound(0, completed, total));
+    m_state->setFullText(QStringLiteral("正在计算 MD5，第 %1/%2 个：%3").arg(completed).arg(total).arg(path));
+    m_services.showStatus(StatusState::Busy, QStringLiteral("正在计算 MD5 %1/%2").arg(completed).arg(total));
 }
 
 void Md5ComparePage::onFinished()
@@ -642,23 +762,59 @@ void Md5ComparePage::onFinished()
         showFailure(error);
     } else {
         m_hasResult = true;
+        m_comparedA = m_activeA;
+        m_comparedB = m_activeB;
         m_result = result;
         m_model->setEntries(result.entries);
         m_problems->setPlainText(formatProblems(result));
         m_counts->setText(formatCounts(result));
         m_bar->setValue(100);
         const QString summary = formatCounts(result);
-        const QString state = result.truncated ? QStringLiteral("比较完成（已达扫描上限，结果不完整）")
-                                               : QStringLiteral("比较完成");
+        QString state = QStringLiteral("比较完成");
+        if (result.truncated)
+            state = QStringLiteral("比较完成，扫描达到上限，结果不完整");
+        else if (result.problemCount > 0)
+            state = QStringLiteral("比较完成，有 %1 项问题，请查看下方列表").arg(result.problemCount);
         m_state->setFullText(state);
-        if (result.problemCount > 0 || result.truncated)
+        const bool needsAttention = result.problemCount > 0 || result.truncated;
+        if (needsAttention)
             m_services.logWarning(state + QStringLiteral("。") + summary);
         else
             m_services.logSuccess(summary);
-        m_services.showStatus(result.truncated ? StatusState::Info : StatusState::Success,
-                              result.truncated ? state : summary);
+        m_services.showStatus(needsAttention ? StatusState::Info : StatusState::Success,
+                              needsAttention ? state : summary);
     }
     applyFilter();
+    updateActions();
+}
+
+void Md5ComparePage::onExportFinished()
+{
+    if (!m_exportThread)
+        return;
+    const bool ok = m_exportThread->ok();
+    const QString error = m_exportThread->error();
+    ExportThread *thread = m_exportThread;
+    m_exportThread = nullptr;
+    thread->deleteLater();
+    m_running = false;
+    m_lock.release();
+
+    m_bar->setRange(0, 100);
+    if (ok) {
+        m_bar->setValue(100);
+        m_state->setFullText(QStringLiteral("已导出报告"));
+        m_services.logSuccess(QStringLiteral("已导出报告"));
+        m_services.showStatus(StatusState::Success, QStringLiteral("已导出报告"));
+    } else if (m_cancelRequested.load(std::memory_order_acquire)) {
+        m_bar->setValue(0);
+        m_state->setFullText(QStringLiteral("导出已取消，比较结果还在"));
+        m_services.logWarning(QStringLiteral("导出已取消"));
+        m_services.showStatus(StatusState::Info, QStringLiteral("导出已取消"));
+    } else {
+        m_bar->setValue(0);
+        showFailure(error.isEmpty() ? QStringLiteral("无法写入报告") : error);
+    }
     updateActions();
 }
 

@@ -22,6 +22,7 @@ namespace tw {
 class CompareResultModel;
 class CompareThread;
 class ElidedLabel;
+class ExportThread;
 
 // 目录 MD5 比较页。比较在后台线程进行，期间持有导航锁。
 class Md5ComparePage : public QWidget
@@ -34,6 +35,8 @@ public:
 
     bool isBusy() const { return m_running; }
     void abort();
+    // 把当前比较结果写到 path。对话框由导出按钮负责；测试可以直接调用。
+    void exportTo(const QString &path);
 
 private:
     void browse(QLineEdit *edit, const QString &title);
@@ -42,6 +45,7 @@ private:
     void exportReport();
     void onProgress(bool enumerating, int completed, int total, const QString &path);
     void onFinished();
+    void onExportFinished();
     void applyFilter();
     void updateActions();
     void loadState();
@@ -54,9 +58,14 @@ private:
     CompareResult m_result;
     CompareResultModel *m_model = nullptr;
     CompareThread *m_thread = nullptr;
+    ExportThread *m_exportThread = nullptr;
     std::atomic<bool> m_cancelRequested{false};
     bool m_running = false;
     bool m_hasResult = false;
+    QString m_activeA;
+    QString m_activeB;
+    QString m_comparedA;
+    QString m_comparedB;
 
     QLineEdit *m_dirA = nullptr;
     QLineEdit *m_dirB = nullptr;

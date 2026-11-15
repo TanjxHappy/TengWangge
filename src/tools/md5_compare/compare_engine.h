@@ -42,6 +42,7 @@ struct CompareResult {
     int differentCount = 0;
     int onlyInACount = 0;
     int onlyInBCount = 0;
+    // 表格里状态为「问题」的行数。同一相对路径的多条说明只计一行。
     int problemCount = 0;
 };
 
@@ -80,8 +81,10 @@ bool compareDirectories(const QString &dirA, const QString &dirB, CompareResult 
                         const CompareProgressCallback &progress = {},
                         const CompareCancelCallback &shouldCancel = {}, CompareLimits limits = {});
 
-// 把结果写成 UTF-8 CSV（带 BOM，字段一律加引号）。调用方负责不要把路径指进被比较的目录。
-bool writeCompareReport(const QString &filePath, const CompareResult &result, QString *error);
+// 把结果写成 UTF-8 CSV（带 BOM，字段一律加引号）。按行写入，不把整份报告攒在内存里。
+// 取消时不留下半成品文件。调用方负责不要把路径指进被比较的目录。
+bool writeCompareReport(const QString &filePath, const CompareResult &result, QString *error,
+                        const CompareCancelCallback &shouldCancel = {});
 
 // 导出路径落在任一被比较目录（或其符号链接）之内时返回原因，否则返回空串。
 QString compareReportBlockReason(const QString &dirA, const QString &dirB, const QString &reportPath);

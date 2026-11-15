@@ -1,10 +1,14 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include "tools/md5_compare/compare_engine.h"
 
 #include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QMap>
+#include <QHash>
 #include <QSaveFile>
 #include <QSet>
 #include <QStringList>
@@ -13,7 +17,9 @@
 #include <cstring>
 
 #include <dirent.h>
+#include <fcntl.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace tw {
 namespace {
@@ -27,14 +33,44 @@ struct InodeId {
     bool operator==(const InodeId &other) const { return dev == other.dev && ino == other.ino; }
 };
 
-QString errnoText()
-{
-    return QString::fromLocal8Bit(std::strerror(errno));
-}
-
 QByteArray encoded(const QString &path)
 {
     return QFile::encodeName(path);
+}
+
+QString ioReason(int err)
+{
+    switch (err) {
+    case EACCES:
+    case EPERM:
+        return QStringLiteral("没有权限");
+    case ENOENT:
+        return QStringLiteral("已经不存在");
+    case ELOOP:
+        return QStringLiteral("符号链接会形成循环");
+    case ENAMETOOLONG:
+        return QStringLiteral("路径太长");
+    case ENOTDIR:
+        return QStringLiteral("路径中有一项不是目录");
+    case EIO:
+        return QStringLiteral("读取数据失败");
+    case EISDIR:
+        return QStringLiteral("这是一个目录");
+    default:
+        break;
+    }
+    return QString::fromLocal8Bit(std::strerror(err));
+}
+
+int openReadOnly(const QString &path, int extraFlags)
+{
+    const QByteArray name = encoded(path);
+    const int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | extraFlags;
+    for (;;) {
+        const int fd = ::open(name.constData(), flags);
+        if (fd >= 0 || errno != EINTR)
+            return fd;
+    }
 }
 
 bool readLinkStat(const QString &path, struct stat *out, bool follow, QString *error)
@@ -44,7 +80,7 @@ bool readLinkStat(const QString &path, struct stat *out, bool follow, QString *e
     if (rc != 0) {
         const int saved = errno;
         if (error)
-            *error = QString::fromLocal8Bit(std::strerror(saved));
+            *error = ioReason(saved);
         errno = saved;
         return false;
     }
@@ -104,7 +140,7 @@ QString sideLabel(const QString &side)
 }
 
 struct ListedWalk {
-    QMap<QString, QString> files;
+    QHash<QString, QString> files;
     QString rootCanonical;
     QVector<CompareProblem> problems;
     bool cancelled = false;
@@ -119,16 +155,21 @@ struct Frame {
 
 struct DirCloser {
     DIR *dir = nullptr;
+    int fd = -1;
     ~DirCloser()
     {
         if (dir)
             ::closedir(dir);
+        else if (fd >= 0)
+            ::close(fd);
     }
     DirCloser(const DirCloser &) = delete;
     DirCloser &operator=(const DirCloser &) = delete;
-    explicit DirCloser(DIR *handle)
-        : dir(handle)
+    explicit DirCloser(int descriptor)
+        : fd(descriptor)
     {
+        if (fd >= 0)
+            dir = ::fdopendir(fd);
     }
 };
 
@@ -153,10 +194,10 @@ void tally(CompareResult *result)
             ++result->onlyInBCount;
             break;
         case CompareStatus::Problem:
+            ++result->problemCount;
             break;
         }
     }
-    result->problemCount = result->problems.size();
 }
 
 bool cancelledNow(const CompareCancelCallback &shouldCancel)
@@ -203,7 +244,8 @@ ListedWalk walkDirectory(const QString &side, const QString &rootAbs, const QStr
     };
 
     QVector<Frame> pending;
-    pending.append(Frame{rootAbs, QString(), QVector<InodeId>{rootId}});
+    // 从规范路径打开，避免把用户选中的符号链接本身当成越界链接。
+    pending.append(Frame{rootCanonical, QString(), QVector<InodeId>{rootId}});
 
     while (!pending.isEmpty() && !stop) {
         if (cancelledNow(shouldCancel)) {
@@ -218,10 +260,14 @@ ListedWalk walkDirectory(const QString &side, const QString &rootAbs, const QStr
             return walk;
         }
 
-        DirCloser handle(::opendir(encoded(frame.path).constData()));
+        DirCloser handle(openReadOnly(frame.path, O_DIRECTORY));
         if (!handle.dir) {
-            walk.problems.append(
-                {side, frame.relPrefix, QStringLiteral("无法读取目录：%1").arg(errnoText())});
+            const int saved = errno;
+            const QString reason = ioReason(saved);
+            const QString message = frame.relPrefix.isEmpty() || saved != ELOOP
+                                        ? QStringLiteral("无法读取目录：%1").arg(reason)
+                                        : QStringLiteral("符号链接会形成循环，已跳过");
+            walk.problems.append({side, frame.relPrefix, message});
             if (walk.files.size() + walk.problems.size() >= limits.maxEntries)
                 noteLimit(QStringLiteral("已达到扫描上限，其余项目未列入比较"));
             continue;
@@ -347,7 +393,8 @@ ListedWalk walkDirectory(const QString &side, const QString &rootAbs, const QStr
                 continue;
             }
 
-            walk.problems.append({side, childRel, QStringLiteral("不是普通文件，已跳过")});
+            walk.problems.append(
+                {side, childRel, QStringLiteral("不是普通文件（例如管道或设备），已跳过")});
         }
     }
     return walk;
@@ -454,18 +501,37 @@ FileHashStatus hashFileMd5(const QString &absolutePath, const QString &rootCanon
         pathToRead = target;
     }
 
-    QFile file(pathToRead);
-    if (!file.open(QIODevice::ReadOnly))
-        return fail(QStringLiteral("无法读取：%1").arg(file.errorString()));
+    // O_NOFOLLOW 避免把中途换上的符号链接跟着读出去；O_NONBLOCK 避免管道把线程堵死。
+    const int fd = openReadOnly(pathToRead, O_NONBLOCK);
+    if (fd < 0)
+        return fail(QStringLiteral("无法读取：%1").arg(ioReason(errno)));
+    struct FdCloser {
+        int descriptor = -1;
+        ~FdCloser()
+        {
+            if (descriptor >= 0)
+                ::close(descriptor);
+        }
+    } closer;
+    closer.descriptor = fd;
+
+    struct stat opened;
+    if (::fstat(fd, &opened) != 0)
+        return fail(QStringLiteral("无法读取：%1").arg(ioReason(errno)));
+    if (!S_ISREG(opened.st_mode))
+        return fail(QStringLiteral("不是普通文件"));
 
     QCryptographicHash hash(QCryptographicHash::Md5);
     QByteArray buffer(kReadChunkBytes, Qt::Uninitialized);
     while (true) {
         if (cancelledNow(shouldCancel))
             return cancel();
-        const qint64 n = file.read(buffer.data(), buffer.size());
-        if (n < 0)
-            return fail(QStringLiteral("无法读取：%1").arg(file.errorString()));
+        const ssize_t n = ::read(fd, buffer.data(), static_cast<size_t>(buffer.size()));
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return fail(QStringLiteral("无法读取：%1").arg(ioReason(errno)));
+        }
         if (n == 0)
             break;
         hash.addData(buffer.constData(), static_cast<int>(n));
@@ -558,7 +624,7 @@ bool compareDirectories(const QString &dirA, const QString &dirB, CompareResult 
     if (!rootErrorB.isEmpty())
         return reject(QStringLiteral("目录 B：%1").arg(rootErrorB));
 
-    QMap<QString, QStringList> details;
+    QHash<QString, QStringList> details;
     QSet<QString> paths;
     auto takeProblems = [&](const ListedWalk &walk) {
         for (const CompareProblem &problem : walk.problems) {
@@ -653,7 +719,8 @@ bool compareDirectories(const QString &dirA, const QString &dirB, CompareResult 
     return true;
 }
 
-bool writeCompareReport(const QString &filePath, const CompareResult &result, QString *error)
+bool writeCompareReport(const QString &filePath, const CompareResult &result, QString *error,
+                        const CompareCancelCallback &shouldCancel)
 {
     if (error)
         error->clear();
@@ -675,19 +742,11 @@ bool writeCompareReport(const QString &filePath, const CompareResult &result, QS
             *error = QStringLiteral("导出目录不存在：%1").arg(parent);
         return false;
     }
-
-    QStringList lines;
-    lines.append(QStringList{csvQuote(QStringLiteral("相对路径")), csvQuote(QStringLiteral("状态")),
-                             csvQuote(QStringLiteral("目录A的MD5")), csvQuote(QStringLiteral("目录B的MD5")),
-                             csvQuote(QStringLiteral("说明"))}
-                     .join(QLatin1Char(',')));
-    for (const CompareEntry &entry : result.entries) {
-        lines.append(QStringList{csvQuote(entry.relativePath), csvQuote(compareStatusLabel(entry.status)),
-                                 csvQuote(entry.md5A), csvQuote(entry.md5B), csvQuote(entry.detail)}
-                         .join(QLatin1Char(',')));
+    if (cancelledNow(shouldCancel)) {
+        if (error)
+            *error = QStringLiteral("导出已取消");
+        return false;
     }
-    const QByteArray payload = QByteArray("\xEF\xBB\xBF") + lines.join(QLatin1Char('\n')).toUtf8()
-                               + QByteArray("\n");
 
     QSaveFile file(path);
     if (!file.open(QIODevice::WriteOnly)) {
@@ -695,17 +754,57 @@ bool writeCompareReport(const QString &filePath, const CompareResult &result, QS
             *error = QStringLiteral("无法写入报告：%1").arg(file.errorString());
         return false;
     }
-    if (file.write(payload) != payload.size()) {
+
+    auto fail = [&](const QString &message) {
         if (error)
-            *error = QStringLiteral("无法写入报告：%1").arg(file.errorString());
+            *error = message;
         file.cancelWriting();
         return false;
+    };
+
+    QByteArray pending;
+    pending.reserve(64 * 1024);
+    auto flush = [&]() {
+        if (pending.isEmpty())
+            return true;
+        const bool wrote = file.write(pending) == pending.size();
+        pending.clear();
+        return wrote;
+    };
+    auto appendLine = [&](const QString &line) {
+        pending.append(line.toUtf8());
+        pending.append('\n');
+        if (pending.size() >= 64 * 1024 && !flush())
+            return false;
+        return true;
+    };
+
+    pending.append("\xEF\xBB\xBF");
+    const QString header = QStringList{csvQuote(QStringLiteral("相对路径")), csvQuote(QStringLiteral("状态")),
+                                       csvQuote(QStringLiteral("目录A的MD5")),
+                                       csvQuote(QStringLiteral("目录B的MD5")),
+                                       csvQuote(QStringLiteral("说明"))}
+                               .join(QLatin1Char(','));
+    if (!appendLine(header))
+        return fail(QStringLiteral("无法写入报告：%1").arg(file.errorString()));
+
+    for (int i = 0; i < result.entries.size(); ++i) {
+        if ((i % 32) == 0 && cancelledNow(shouldCancel))
+            return fail(QStringLiteral("导出已取消"));
+        const CompareEntry &entry = result.entries.at(i);
+        const QString line = QStringList{csvQuote(entry.relativePath),
+                                         csvQuote(compareStatusLabel(entry.status)), csvQuote(entry.md5A),
+                                         csvQuote(entry.md5B), csvQuote(entry.detail)}
+                                 .join(QLatin1Char(','));
+        if (!appendLine(line))
+            return fail(QStringLiteral("无法写入报告：%1").arg(file.errorString()));
     }
-    if (!file.commit()) {
-        if (error)
-            *error = QStringLiteral("无法写入报告：%1").arg(file.errorString());
-        return false;
-    }
+    if (!flush())
+        return fail(QStringLiteral("无法写入报告：%1").arg(file.errorString()));
+    if (cancelledNow(shouldCancel))
+        return fail(QStringLiteral("导出已取消"));
+    if (!file.commit())
+        return fail(QStringLiteral("无法写入报告：%1").arg(file.errorString()));
     return true;
 }
 

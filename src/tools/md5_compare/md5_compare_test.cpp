@@ -1,5 +1,8 @@
 #include "core/data_paths.h"
 #include "core/platform_services.h"
+#include "shell/elided_label.h"
+#include "shell/main_window.h"
+#include "shell/tool_registry.h"
 #include "tools/md5_compare/compare_engine.h"
 #include "tools/md5_compare/md5_compare_tool.h"
 
@@ -12,6 +15,7 @@
 #include <QFileInfo>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPlainTextEdit>
 #include <QPushButton>
 #include <QTableView>
 #include <QTemporaryDir>
@@ -122,8 +126,12 @@ private slots:
     void compare_hiddenNestedAndKnownMd5();
     void compare_symlinkEscapeIsNotFollowed();
     void compare_symlinkLoopIsBounded();
+    void compare_danglingAndSelfSymlinkAreProblems();
+    void compare_rootSymlinkIsTheStartDirectory();
     void compare_internalSymlinksAreFollowed();
     void compare_specialFileIsReported();
+    void compare_fifoHashDoesNotBlock();
+    void compare_problemRowCountsOnce();
     void compare_unreadableFileIsReported();
     void compare_unreadableDirectoryIsReported();
     void compare_cancelDropsPartialResults();
@@ -132,10 +140,15 @@ private slots:
     void compare_doesNotWriteComparedDirectories();
     void compare_rejectsMissingOrNonDirectory();
     void report_csvAndBlockedPaths();
+    void report_cancelLeavesNoFile();
     void filter_matchesStatusAndPath();
 
     void ui_compareShowsRowsAndReleasesLock();
+    void ui_problemResultIsNotShownAsSuccess();
+    void ui_exportHoldsLockAndRejectsComparedDir();
+    void ui_shutdownDuringExportReleasesLock();
     void ui_layoutStaysSeparatedWhenNarrow();
+    void ui_tableVisibleInDefaultWindow();
     void ui_shutdownWhileRunningReleasesLock();
     void ui_remembersPathsOnlyInDataDir();
 };
@@ -387,6 +400,46 @@ void Md5CompareTests::compare_symlinkLoopIsBounded()
     QVERIFY(findEntry(result, QStringLiteral("b/f.txt")) == nullptr);
 }
 
+void Md5CompareTests::compare_danglingAndSelfSymlinkAreProblems()
+{
+    QTemporaryDir left;
+    QTemporaryDir right;
+    QVERIFY(left.isValid() && right.isValid());
+    QVERIFY(QFile::link(QStringLiteral("missing-target"), left.filePath(QStringLiteral("gone"))));
+    QVERIFY(QFile::link(QStringLiteral("self"), left.filePath(QStringLiteral("self"))));
+
+    QElapsedTimer timer;
+    timer.start();
+    tw::CompareResult result;
+    QString error;
+    QVERIFY2(tw::compareDirectories(left.path(), right.path(), &result, &error), qPrintable(error));
+    QVERIFY2(timer.elapsed() < 3000, qPrintable(QString::number(timer.elapsed())));
+    QVERIFY(hasProblem(result, QStringLiteral("gone"), QStringLiteral("无法解析")));
+    QVERIFY(hasProblem(result, QStringLiteral("self"), QStringLiteral("循环")));
+    QCOMPARE(result.onlyInACount, 0);
+    QCOMPARE(result.problemCount, 2);
+}
+
+void Md5CompareTests::compare_rootSymlinkIsTheStartDirectory()
+{
+    QTemporaryDir real;
+    QTemporaryDir other;
+    QTemporaryDir parent;
+    QVERIFY(real.isValid() && other.isValid() && parent.isValid());
+    QVERIFY(writeFile(real.filePath(QStringLiteral("a.txt")), "abc"));
+    const QString link = parent.filePath(QStringLiteral("link"));
+    QVERIFY(QFile::link(real.path(), link));
+
+    tw::CompareResult result;
+    QString error;
+    QVERIFY2(tw::compareDirectories(link, other.path(), &result, &error), qPrintable(error));
+    const tw::CompareEntry *file = findEntry(result, QStringLiteral("a.txt"));
+    QVERIFY(file);
+    QCOMPARE(file->status, tw::CompareStatus::OnlyInA);
+    QCOMPARE(file->md5A, QStringLiteral("900150983cd24fb0d6963f7d28e17f72"));
+    QCOMPARE(result.problemCount, 0);
+}
+
 void Md5CompareTests::compare_internalSymlinksAreFollowed()
 {
     QTemporaryDir left;
@@ -434,6 +487,44 @@ void Md5CompareTests::compare_specialFileIsReported()
     QCOMPARE(pipe->status, tw::CompareStatus::Problem);
     QVERIFY(pipe->md5A.isEmpty());
     QCOMPARE(result.onlyInACount, 0);
+}
+
+void Md5CompareTests::compare_fifoHashDoesNotBlock()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString pipe = dir.filePath(QStringLiteral("pipe"));
+    QCOMPARE(::mkfifo(QFile::encodeName(pipe).constData(), 0644), 0);
+    QElapsedTimer timer;
+    timer.start();
+    QString hex;
+    QString error;
+    const tw::FileHashStatus status =
+        tw::hashFileMd5(pipe, QFileInfo(dir.path()).canonicalFilePath(), &hex, &error);
+    QVERIFY2(timer.elapsed() < 1000, qPrintable(QString::number(timer.elapsed())));
+    QCOMPARE(status, tw::FileHashStatus::Failed);
+    QVERIFY(hex.isEmpty());
+    QVERIFY(error.contains(QStringLiteral("不是普通文件")));
+}
+
+void Md5CompareTests::compare_problemRowCountsOnce()
+{
+    QTemporaryDir left;
+    QTemporaryDir right;
+    QVERIFY(left.isValid() && right.isValid());
+    QCOMPARE(::mkfifo(QFile::encodeName(left.filePath(QStringLiteral("pipe"))).constData(), 0644), 0);
+    QCOMPARE(::mkfifo(QFile::encodeName(right.filePath(QStringLiteral("pipe"))).constData(), 0644), 0);
+
+    tw::CompareResult result;
+    QString error;
+    QVERIFY2(tw::compareDirectories(left.path(), right.path(), &result, &error), qPrintable(error));
+    QCOMPARE(result.problems.size(), 2);
+    QCOMPARE(result.problemCount, 1);
+    const tw::CompareEntry *pipe = findEntry(result, QStringLiteral("pipe"));
+    QVERIFY(pipe);
+    QCOMPARE(pipe->status, tw::CompareStatus::Problem);
+    QVERIFY(pipe->detail.contains(QStringLiteral("目录 A")));
+    QVERIFY(pipe->detail.contains(QStringLiteral("目录 B")));
 }
 
 void Md5CompareTests::compare_unreadableFileIsReported()
@@ -654,6 +745,24 @@ void Md5CompareTests::report_csvAndBlockedPaths()
                  .isEmpty());
 }
 
+void Md5CompareTests::report_cancelLeavesNoFile()
+{
+    QTemporaryDir out;
+    QVERIFY(out.isValid());
+    tw::CompareResult result;
+    tw::CompareEntry entry;
+    entry.relativePath = QStringLiteral("a.txt");
+    entry.status = tw::CompareStatus::Same;
+    entry.md5A = QStringLiteral("900150983cd24fb0d6963f7d28e17f72");
+    entry.md5B = entry.md5A;
+    result.entries.append(entry);
+    const QString report = out.filePath(QStringLiteral("报告.csv"));
+    QString error;
+    QVERIFY(!tw::writeCompareReport(report, result, &error, [] { return true; }));
+    QVERIFY(error.contains(QStringLiteral("取消")));
+    QVERIFY(!QFileInfo::exists(report));
+}
+
 void Md5CompareTests::filter_matchesStatusAndPath()
 {
     tw::CompareEntry entry;
@@ -746,6 +855,114 @@ void Md5CompareTests::ui_compareShowsRowsAndReleasesLock()
     QCOMPARE(snapshotTree(dirB), beforeB);
 }
 
+void Md5CompareTests::ui_problemResultIsNotShownAsSuccess()
+{
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    const QString dirA = temp.filePath(QStringLiteral("a"));
+    const QString dirB = temp.filePath(QStringLiteral("b"));
+    QVERIFY(QDir().mkpath(dirA));
+    QVERIFY(QDir().mkpath(dirB));
+    QCOMPARE(::mkfifo(QFile::encodeName(dirA + QStringLiteral("/pipe")).constData(), 0644), 0);
+
+    tw::PlatformServices platform(tw::DataPaths(temp.filePath(QStringLiteral("data"))));
+    tw::Md5CompareTool tool;
+    QString error;
+    QVERIFY2(tool.initialize(contextFor(platform, tool), &error), qPrintable(error));
+    const auto pages = tool.createPages();
+    std::unique_ptr<QWidget> owner(pages.at(0).widget);
+    tw::Md5ComparePage *page = tool.page();
+    page->findChild<QLineEdit *>(QStringLiteral("md5DirA"))->setText(dirA);
+    page->findChild<QLineEdit *>(QStringLiteral("md5DirB"))->setText(dirB);
+    page->findChild<QPushButton *>(QStringLiteral("md5Start"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!page->isBusy(), 5000);
+    QVERIFY(!platform.gate()->isLocked());
+    QCOMPARE(platform.status()->current(tool.info().id).state, tw::StatusState::Info);
+    auto *state = page->findChild<tw::ElidedLabel *>(QStringLiteral("md5State"));
+    auto *counts = page->findChild<QLabel *>(QStringLiteral("md5Counts"));
+    QVERIFY(state && counts);
+    QVERIFY(state->fullText().contains(QStringLiteral("问题")));
+    QVERIFY(counts->text().contains(QStringLiteral("问题 1")));
+}
+
+void Md5CompareTests::ui_exportHoldsLockAndRejectsComparedDir()
+{
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    const QString dirA = temp.filePath(QStringLiteral("a"));
+    const QString dirB = temp.filePath(QStringLiteral("b"));
+    QVERIFY(writeFile(dirA + QStringLiteral("/a.txt"), "abc"));
+    QVERIFY(QDir().mkpath(dirB));
+
+    tw::PlatformServices platform(tw::DataPaths(temp.filePath(QStringLiteral("data"))));
+    tw::Md5CompareTool tool;
+    QString error;
+    QVERIFY2(tool.initialize(contextFor(platform, tool), &error), qPrintable(error));
+    const auto pages = tool.createPages();
+    std::unique_ptr<QWidget> owner(pages.at(0).widget);
+    tw::Md5ComparePage *page = tool.page();
+    auto *editA = page->findChild<QLineEdit *>(QStringLiteral("md5DirA"));
+    page->findChild<QLineEdit *>(QStringLiteral("md5DirB"))->setText(dirB);
+    editA->setText(dirA);
+    page->findChild<QPushButton *>(QStringLiteral("md5Start"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!page->isBusy(), 5000);
+    QCOMPARE(page->findChild<QTableView *>(QStringLiteral("md5Table"))->model()->rowCount(), 1);
+
+    editA->setText(temp.path());
+    page->exportTo(dirA + QStringLiteral("/out.csv"));
+    QVERIFY(!page->isBusy());
+    QVERIFY(!platform.gate()->isLocked());
+    QVERIFY(!QFileInfo::exists(dirA + QStringLiteral("/out.csv")));
+    auto *state = page->findChild<tw::ElidedLabel *>(QStringLiteral("md5State"));
+    QVERIFY(state->fullText().contains(QStringLiteral("不能把报告写进")));
+
+    const QString report = temp.filePath(QStringLiteral("报告.csv"));
+    page->exportTo(report);
+    QVERIFY(page->isBusy());
+    QVERIFY(platform.gate()->isLocked());
+    QVERIFY(platform.gate()->reason().contains(QStringLiteral("正在导出比较报告")));
+    QTRY_VERIFY_WITH_TIMEOUT(!page->isBusy(), 5000);
+    QVERIFY(!platform.gate()->isLocked());
+    QVERIFY(QFileInfo::exists(report));
+    QFile file(report);
+    QVERIFY(file.open(QIODevice::ReadOnly));
+    QVERIFY(file.readAll().startsWith("\xEF\xBB\xBF"));
+    QCOMPARE(page->findChild<QTableView *>(QStringLiteral("md5Table"))->model()->rowCount(), 1);
+    QCOMPARE(state->fullText(), QStringLiteral("已导出报告"));
+}
+
+void Md5CompareTests::ui_shutdownDuringExportReleasesLock()
+{
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    const QString dirA = temp.filePath(QStringLiteral("a"));
+    const QString dirB = temp.filePath(QStringLiteral("b"));
+    QVERIFY(writeFile(dirA + QStringLiteral("/a.txt"), "abc"));
+    QVERIFY(QDir().mkpath(dirB));
+
+    tw::PlatformServices platform(tw::DataPaths(temp.filePath(QStringLiteral("data"))));
+    tw::Md5CompareTool tool;
+    QString error;
+    QVERIFY2(tool.initialize(contextFor(platform, tool), &error), qPrintable(error));
+    const auto pages = tool.createPages();
+    std::unique_ptr<QWidget> owner(pages.at(0).widget);
+    tw::Md5ComparePage *page = tool.page();
+    page->findChild<QLineEdit *>(QStringLiteral("md5DirA"))->setText(dirA);
+    page->findChild<QLineEdit *>(QStringLiteral("md5DirB"))->setText(dirB);
+    page->findChild<QPushButton *>(QStringLiteral("md5Start"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!page->isBusy(), 5000);
+
+    page->exportTo(temp.filePath(QStringLiteral("报告.csv")));
+    QVERIFY(page->isBusy());
+    QVERIFY(platform.gate()->isLocked());
+    tool.shutdown();
+    QVERIFY(!page->isBusy());
+    QVERIFY(!platform.gate()->isLocked());
+    QCoreApplication::processEvents();
+    QVERIFY(!platform.gate()->isLocked());
+    tool.shutdown();
+}
+
 void Md5CompareTests::ui_layoutStaysSeparatedWhenNarrow()
 {
     QTemporaryDir temp;
@@ -759,7 +976,8 @@ void Md5CompareTests::ui_layoutStaysSeparatedWhenNarrow()
     QWidget *page = tool.page();
     page->show();
     QVERIFY(QTest::qWaitForWindowExposed(page));
-    const QList<QSize> sizes = {QSize(520, 420), QSize(640, 480), QSize(1100, 720)};
+    const QList<QSize> sizes = {QSize(520, 420), QSize(520, 640), QSize(640, 640), QSize(1100, 720),
+                                QSize(1180, 760)};
     for (const QSize &size : sizes) {
         page->resize(size);
         QCoreApplication::processEvents();
@@ -798,6 +1016,82 @@ void Md5CompareTests::ui_layoutStaysSeparatedWhenNarrow()
                      && startBox.right() <= page->width(),
                  qPrintable(dump));
         QVERIFY2(startBox.top() >= b.bottom(), qPrintable(dump));
+
+        auto *table = page->findChild<QTableView *>(QStringLiteral("md5Table"));
+        auto *search = page->findChild<QLineEdit *>(QStringLiteral("md5Search"));
+        auto *filter = page->findChild<QComboBox *>(QStringLiteral("md5Filter"));
+        QVERIFY(table && search && filter);
+        const QRect tableBox = box(table);
+        const QRect searchBox = box(search);
+        const QRect filterBox = box(filter);
+        QVERIFY2(!tableBox.intersects(startBox), qPrintable(dump));
+        QVERIFY2(!searchBox.intersects(filterBox), qPrintable(dump));
+        QVERIFY2(searchBox.right() <= page->width() && filterBox.right() <= page->width(), qPrintable(dump));
+        QVERIFY2(tableBox.height() >= table->fontMetrics().height(), qPrintable(dump));
+        QVERIFY2(table->viewport()->height() >= table->fontMetrics().height(), qPrintable(dump));
+        if (size.height() >= 640)
+            QVERIFY2(tableBox.top() < page->height() && tableBox.bottom() > tableBox.top(), qPrintable(dump));
+    }
+}
+
+void Md5CompareTests::ui_tableVisibleInDefaultWindow()
+{
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    auto platform = std::make_unique<tw::PlatformServices>(tw::DataPaths(temp.filePath(QStringLiteral("data"))));
+    tw::ToolRegistry registry;
+    QString error;
+    QVERIFY2(registry.add(std::make_unique<tw::Md5CompareTool>(), &error), qPrintable(error));
+    tw::MainWindow window(std::move(platform), std::move(registry));
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto *table = window.findChild<QTableView *>(QStringLiteral("md5Table"));
+    auto *problems = window.findChild<QPlainTextEdit *>(QStringLiteral("md5Problems"));
+    auto *dirA = window.findChild<QLineEdit *>(QStringLiteral("md5DirA"));
+    auto *dirB = window.findChild<QLineEdit *>(QStringLiteral("md5DirB"));
+    auto *browseA = window.findChild<QPushButton *>(QStringLiteral("md5BrowseA"));
+    auto *start = window.findChild<QPushButton *>(QStringLiteral("md5Start"));
+    QVERIFY(table && problems && dirA && dirB && browseA && start);
+
+    const QList<QSize> sizes = {QSize(900, 560), QSize(1180, 760)};
+    for (const QSize &size : sizes) {
+        window.resize(size);
+        QCoreApplication::processEvents();
+        const auto box = [&window](QWidget *widget) {
+            return QRect(widget->mapTo(&window, QPoint(0, 0)), widget->size());
+        };
+        const QRect tableBox = box(table);
+        const QRect fieldA = box(dirA);
+        const QRect fieldB = box(dirB);
+        const QRect browse = box(browseA);
+        const QRect startBox = box(start);
+        const QRect problemBox = box(problems);
+        const QString dump =
+            QStringLiteral("size=%1x%2 field=%3x%4 browseRight=%5 table=%6x%7 problems=%8,%9 %10x%11")
+                .arg(size.width())
+                .arg(size.height())
+                .arg(fieldA.width())
+                .arg(fieldA.height())
+                .arg(browse.right())
+                .arg(tableBox.height())
+                .arg(table->viewport()->height())
+                .arg(problemBox.x())
+                .arg(problemBox.y())
+                .arg(problemBox.width())
+                .arg(problemBox.height());
+        QVERIFY2(!fieldA.intersects(browse), qPrintable(dump));
+        QVERIFY2(!fieldA.intersects(fieldB), qPrintable(dump));
+        QVERIFY2(!tableBox.intersects(startBox), qPrintable(dump));
+        QVERIFY2(browse.right() <= window.width(), qPrintable(dump));
+        QVERIFY2(fieldA.height() >= dirA->fontMetrics().height(), qPrintable(dump));
+        QVERIFY2(table->viewport()->height() >= table->fontMetrics().height(), qPrintable(dump));
+        if (size.height() >= 760) {
+            const QRect visible = tableBox.intersected(window.rect());
+            const QRect problemsVisible = problemBox.intersected(window.rect());
+            QVERIFY2(visible.height() >= table->fontMetrics().height(), qPrintable(dump));
+            QVERIFY2(problemsVisible.height() >= problems->fontMetrics().height(), qPrintable(dump));
+        }
     }
 }
 
