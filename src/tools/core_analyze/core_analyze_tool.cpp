@@ -24,26 +24,44 @@ namespace {
 QLabel *makeLabel(const QString &text, const char *role)
 {
     auto *label = new QLabel(text);
-    label->setProperty("role", QString::fromLatin1(role));
+    if (role != nullptr && role[0] != '\0')
+        label->setProperty("role", QString::fromLatin1(role));
     label->setWordWrap(true);
     label->setMinimumWidth(0);
     return label;
 }
 
-QWidget *pathRow(QLineEdit *edit, QPushButton *browse, QPushButton *extra = nullptr)
+// 结论区自己滚动，高度封顶，避免长句子把命令说明和导出按钮挤出窗口。
+class BoundedScroll final : public QScrollArea
 {
-    auto *row = new QWidget;
-    auto *layout = new QHBoxLayout(row);
-    layout->setContentsMargins(0, 0, 0, 0);
-    layout->setSpacing(8);
-    edit->setMinimumWidth(0);
-    edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    layout->addWidget(edit, 1);
-    layout->addWidget(browse);
-    if (extra)
-        layout->addWidget(extra);
-    return row;
-}
+public:
+    BoundedScroll(int hint, int minimum, int maximum, QWidget *parent = nullptr)
+        : QScrollArea(parent)
+        , m_hint(hint)
+    {
+        setFrameShape(QFrame::NoFrame);
+        setWidgetResizable(true);
+        setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        setFocusPolicy(Qt::NoFocus);
+        viewport()->setAutoFillBackground(false);
+        setMinimumHeight(minimum);
+        setMaximumHeight(maximum);
+        setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    }
+
+    QSize sizeHint() const override
+    {
+        return QSize(320, m_hint);
+    }
+
+    QSize minimumSizeHint() const override
+    {
+        return QSize(0, minimumHeight());
+    }
+
+private:
+    int m_hint;
+};
 
 QString startDirectory(const QLineEdit *edit)
 {
@@ -73,32 +91,21 @@ CoreAnalyzePage::CoreAnalyzePage(const ToolServices &services, QWidget *dialogPa
     , m_services(services)
     , m_dialogParent(dialogParent)
 {
-    auto *outer = new QVBoxLayout(this);
-    outer->setContentsMargins(0, 0, 0, 0);
-
-    auto *scroll = new QScrollArea;
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    scroll->setFocusPolicy(Qt::NoFocus);
-    scroll->viewport()->setAutoFillBackground(false);
-    outer->addWidget(scroll);
-
-    auto *content = new QWidget;
-    auto *layout = new QVBoxLayout(content);
-    layout->setContentsMargins(28, 24, 28, 24);
-    layout->setSpacing(14);
-    scroll->setWidget(content);
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(16, 12, 16, 12);
+    layout->setSpacing(8);
 
     layout->addWidget(makeLabel(QStringLiteral("文件分析"), "pageTitle"));
     layout->addWidget(makeLabel(
-        QStringLiteral("选择一份 Linux core 文件，查看程序为何停止，并生成一份能看懂的说明。"),
+        QStringLiteral("选择 Linux core 文件，查看程序为何停止，并可导出说明。"),
         "pageSubtitle"));
 
     auto *pick = new QFrame;
     pick->setProperty("role", QStringLiteral("card"));
+    pick->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
     auto *pickLayout = new QVBoxLayout(pick);
-    pickLayout->setContentsMargins(16, 14, 16, 14);
-    pickLayout->setSpacing(10);
+    pickLayout->setContentsMargins(12, 10, 12, 10);
+    pickLayout->setSpacing(8);
 
     m_coreEdit = new QLineEdit;
     m_coreEdit->setObjectName(QStringLiteral("corePath"));
@@ -126,14 +133,33 @@ CoreAnalyzePage::CoreAnalyzePage(const ToolServices &services, QWidget *dialogPa
     auto *symbolDir = new QPushButton(QStringLiteral("目录"));
     symbolDir->setAccessibleName(QStringLiteral("浏览调试符号目录"));
 
-    pickLayout->addWidget(makeLabel(QStringLiteral("core 文件"), "fieldLabel"));
-    pickLayout->addWidget(pathRow(m_coreEdit, coreBrowse));
-    pickLayout->addWidget(makeLabel(QStringLiteral("程序文件（可选）"), "fieldLabel"));
-    pickLayout->addWidget(pathRow(m_exeEdit, exeBrowse));
-    pickLayout->addWidget(makeLabel(QStringLiteral("调试符号（可选）"), "fieldLabel"));
-    pickLayout->addWidget(pathRow(m_symbolEdit, symbolBrowse, symbolDir));
+    auto *paths = new QGridLayout;
+    paths->setContentsMargins(0, 0, 0, 0);
+    paths->setHorizontalSpacing(8);
+    paths->setVerticalSpacing(6);
+    paths->setColumnStretch(1, 1);
+    auto addPath = [&](int row, const QString &name, QLineEdit *edit, QWidget *trailing) {
+        edit->setMinimumWidth(0);
+        edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        auto *label = makeLabel(name, "fieldLabel");
+        label->setWordWrap(false);
+        label->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        paths->addWidget(label, row, 0);
+        paths->addWidget(edit, row, 1);
+        paths->addWidget(trailing, row, 2);
+    };
+    addPath(0, QStringLiteral("core 文件"), m_coreEdit, coreBrowse);
+    addPath(1, QStringLiteral("程序文件"), m_exeEdit, exeBrowse);
+    auto *symbolButtons = new QWidget;
+    auto *symbolLayout = new QHBoxLayout(symbolButtons);
+    symbolLayout->setContentsMargins(0, 0, 0, 0);
+    symbolLayout->setSpacing(8);
+    symbolLayout->addWidget(symbolBrowse);
+    symbolLayout->addWidget(symbolDir);
+    addPath(2, QStringLiteral("调试符号"), m_symbolEdit, symbolButtons);
+    pickLayout->addLayout(paths);
     pickLayout->addWidget(makeLabel(
-        QStringLiteral("调试符号是一份对照表，用来把地址翻译成步骤名称。没有也可以分析。"),
+        QStringLiteral("调试符号用来把地址翻译成步骤名称，没有也可以分析。"),
         "hint"));
 
     m_bar = new QProgressBar;
@@ -142,11 +168,10 @@ CoreAnalyzePage::CoreAnalyzePage(const ToolServices &services, QWidget *dialogPa
     m_bar->setRange(0, 1);
     m_bar->setValue(0);
     m_bar->setTextVisible(false);
+    m_bar->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     m_progress = makeLabel(QStringLiteral("尚未分析"), "hint");
     m_progress->setObjectName(QStringLiteral("progressLabel"));
 
-    auto *buttons = new QHBoxLayout;
-    buttons->setSpacing(8);
     m_start = new QPushButton(QStringLiteral("开始分析"));
     m_start->setObjectName(QStringLiteral("startButton"));
     m_start->setProperty("role", QStringLiteral("primary"));
@@ -158,29 +183,42 @@ CoreAnalyzePage::CoreAnalyzePage(const ToolServices &services, QWidget *dialogPa
     m_export = new QPushButton(QStringLiteral("导出说明"));
     m_export->setObjectName(QStringLiteral("exportButton"));
     m_export->setAccessibleName(QStringLiteral("导出分析说明"));
+    for (QPushButton *button : {m_start, m_cancel, m_export})
+        button->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
+
+    auto *buttons = new QHBoxLayout;
+    buttons->setSpacing(8);
     buttons->addWidget(m_start);
     buttons->addWidget(m_cancel);
     buttons->addWidget(m_export);
-    buttons->addStretch(1);
-
+    buttons->addWidget(m_progress, 1);
     pickLayout->addWidget(m_bar);
-    pickLayout->addWidget(m_progress);
     pickLayout->addLayout(buttons);
     layout->addWidget(pick);
 
+    auto *conclusionScroll = new BoundedScroll(220, 112, 248);
+    conclusionScroll->setObjectName(QStringLiteral("conclusionScroll"));
     auto *result = new QFrame;
     result->setProperty("role", QStringLiteral("card"));
     auto *grid = new QGridLayout(result);
-    grid->setContentsMargins(16, 14, 16, 14);
-    grid->setHorizontalSpacing(18);
-    grid->setVerticalSpacing(10);
+    grid->setContentsMargins(12, 8, 12, 8);
+    grid->setHorizontalSpacing(12);
+    grid->setVerticalSpacing(6);
     grid->setColumnStretch(1, 1);
     grid->addWidget(makeLabel(QStringLiteral("结论"), "sectionTitle"), 0, 0, 1, 2);
 
+    // 按主题 13px 中文留出“建议解决方案”一行的宽度，避免长句子把字段名挤成一字一行。
+    const int nameWidth = 112;
+    grid->setColumnMinimumWidth(0, nameWidth);
     auto addValue = [&](int row, const QString &name, QLabel **slot, const QString &objectName) {
-        grid->addWidget(makeLabel(name, "fieldLabel"), row, 0, Qt::AlignTop);
-        auto *value = makeLabel(QStringLiteral("尚未分析"), "value");
+        auto *nameLabel = makeLabel(name, "fieldLabel");
+        nameLabel->setWordWrap(false);
+        nameLabel->setMinimumWidth(nameWidth);
+        grid->addWidget(nameLabel, row, 0, Qt::AlignTop);
+        auto *value = makeLabel(QStringLiteral("尚未分析"), nullptr);
         value->setObjectName(objectName);
+        value->setMinimumWidth(0);
+        value->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
         value->setTextInteractionFlags(Qt::TextSelectableByMouse);
         value->setAccessibleName(name);
         grid->addWidget(value, row, 1);
@@ -190,20 +228,22 @@ CoreAnalyzePage::CoreAnalyzePage(const ToolServices &services, QWidget *dialogPa
     addValue(2, QStringLiteral("所在步骤"), &m_where, QStringLiteral("whereValue"));
     addValue(3, QStringLiteral("可能原因"), &m_cause, QStringLiteral("causeValue"));
     addValue(4, QStringLiteral("建议解决方案"), &m_suggestion, QStringLiteral("suggestionValue"));
-    layout->addWidget(result);
+    conclusionScroll->setWidget(result);
+    layout->addWidget(conclusionScroll);
 
     layout->addWidget(makeLabel(QStringLiteral("分析说明"), "sectionTitle"));
     layout->addWidget(makeLabel(
-        QStringLiteral("下面是查看 core 文件的步骤。分析之后，会换成这次真正执行过的命令和输出释义。"),
+        QStringLiteral("每一步都有这次实际执行的命令、关键输出和中文释义。"),
         "hint"));
     m_report = new QPlainTextEdit;
     m_report->setObjectName(QStringLiteral("reportView"));
     m_report->setReadOnly(true);
     m_report->setAccessibleName(QStringLiteral("分析说明"));
     m_report->setLineWrapMode(QPlainTextEdit::WidgetWidth);
-    m_report->setMinimumHeight(220);
+    m_report->setMinimumHeight(120);
+    m_report->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     m_report->setPlainText(CoreAnalyzer::usageGuide());
-    layout->addWidget(m_report);
+    layout->addWidget(m_report, 1);
 
     setTabOrder(m_coreEdit, coreBrowse);
     setTabOrder(coreBrowse, m_exeEdit);

@@ -24,6 +24,9 @@ struct SignalPlain
 };
 
 const SignalPlain kSignals[] = {
+    {3, "SIGQUIT", "收到了退出请求",
+     "通常是有人按下了强制退出的组合键，或者别的程序要求它退出。",
+     "如果当时没有人要退出它，请把这份说明交给负责该软件的同事。"},
     {4, "SIGILL", "碰到了这台电脑不认识的指令",
      "程序文件可能和这台电脑不匹配，或者文件已经损坏。",
      "请确认安装的版本适合这台电脑，必要时重新安装后再试。"},
@@ -77,6 +80,9 @@ struct CrashFacts
     bool sawAllocator = false;
     bool symbolsMissing = false;
     bool executableMismatch = false;
+    bool signoFromNotes = false;
+    bool usedCurrentThread = false;
+    bool signalDisagreement = false;
 };
 
 QString quoteArg(const QString &arg)
@@ -141,7 +147,10 @@ HeaderKind readHeader(const QString &path, QString *detail)
 {
     QFile file(path);
     if (!file.open(QIODevice::ReadOnly)) {
-        *detail = QStringLiteral("文件打不开：%1").arg(file.errorString());
+        if (file.error() == QFileDevice::PermissionsError)
+            *detail = QStringLiteral("没有权限读取这个文件。");
+        else
+            *detail = QStringLiteral("文件打不开：%1").arg(file.errorString());
         return HeaderKind::Unreadable;
     }
     const QByteArray header = file.read(64);
@@ -174,18 +183,6 @@ HeaderKind readHeader(const QString &path, QString *detail)
     }
     *detail = QStringLiteral("这是 ELF 文件，但不是 core 记录。");
     return HeaderKind::OtherElf;
-}
-
-QString gdbQuote(const QString &path)
-{
-    QString escaped;
-    escaped.reserve(path.size());
-    for (const QChar ch : path) {
-        if (ch == QLatin1Char('\\') || ch == QLatin1Char('"'))
-            escaped += QLatin1Char('\\');
-        escaped += ch;
-    }
-    return QStringLiteral("\"%1\"").arg(escaped);
 }
 
 QString clipOutput(const QString &output, bool truncated)
@@ -224,14 +221,17 @@ void noteProgram(CrashFacts *facts, const QString &path)
     const QString trimmed = path.trimmed();
     if (trimmed.isEmpty())
         return;
+    const QString cleaned = trimmed.simplified();
+    if (cleaned.isEmpty())
+        return;
     if (facts->programHint.isEmpty()) {
-        facts->programHint = trimmed;
+        facts->programHint = cleaned;
         return;
     }
     const bool havePath = facts->programHint.contains(QLatin1Char('/'));
-    const bool newPath = trimmed.contains(QLatin1Char('/'));
+    const bool newPath = cleaned.contains(QLatin1Char('/'));
     if (!havePath && newPath)
-        facts->programHint = trimmed;
+        facts->programHint = cleaned;
 }
 
 void absorbFileOutput(const QString &text, CrashFacts *facts)
@@ -272,13 +272,13 @@ void absorbReadelf(const QString &text, CrashFacts *facts)
     if (signo > 0 && facts->signalNumber == 0)
         facts->signalNumber = signo;
 
-    const QRegularExpression addrRe(QStringLiteral("\\bsi_addr:\\s*(\\S+)"));
+    const QRegularExpression addrRe(QStringLiteral("\\b(?:si_addr|fault address):\\s*(\\S+)"));
     const QRegularExpressionMatch addr = addrRe.match(text);
     if (addr.hasMatch() && facts->faultAddress.isEmpty())
         facts->faultAddress = addr.captured(1);
 
     const QRegularExpression psargs(QStringLiteral("\\bpsargs:\\s*(.+)"));
-    const QRegularExpression fname(QStringLiteral("\\bfname:\\s*(\\S+)"));
+    const QRegularExpression fname(QStringLiteral("\\bfname:\\s*([^\\s,]+)"));
     const QRegularExpressionMatch ps = psargs.match(text);
     if (ps.hasMatch())
         noteProgram(facts, ps.captured(1));
@@ -289,12 +289,21 @@ void absorbReadelf(const QString &text, CrashFacts *facts)
 
 bool isNullAddress(const QString &address)
 {
-    const QString value = address.trimmed().toLower();
-    return value == QLatin1String("0")
-        || value == QLatin1String("0x0")
-        || value == QLatin1String("(nil)")
-        || value == QLatin1String("nil")
-        || value == QLatin1String("0x0000000000000000");
+    QString value = address.trimmed().toLower();
+    if (value.isEmpty())
+        return false;
+    if (value == QLatin1String("(nil)") || value == QLatin1String("nil"))
+        return true;
+    if (value.startsWith(QLatin1String("0x")))
+        value = value.mid(2);
+    if (value.isEmpty())
+        return true;
+    for (const QChar ch : value) {
+        if (ch == QLatin1Char('0'))
+            continue;
+        return false;
+    }
+    return true;
 }
 
 bool unknownFunction(const QString &function)
@@ -348,20 +357,18 @@ void absorbGdb(const QString &text, CrashFacts *facts)
     const QRegularExpressionMatch term = terminated.match(text);
     if (term.hasMatch()) {
         const QString token = term.captured(1);
-        QString description = term.captured(2).trimmed();
-        if (description.endsWith(QLatin1Char('.')))
-            description.chop(1);
-        facts->signalDescription = description;
-        if (token.startsWith(QLatin1String("SIG")))
+        // 只认 “terminated with signal” 这一句。不要从 SIGINFO 之类的单词里猜信号名。
+        if (token.startsWith(QLatin1String("SIG"))) {
             facts->signalName = token;
-        else
-            facts->signalNumber = token.toInt();
-    }
-    if (facts->signalName.isEmpty()) {
-        const QRegularExpression named(QStringLiteral("\\b(SIG[A-Z][A-Z0-9]+)\\b"));
-        const QRegularExpressionMatch match = named.match(text);
-        if (match.hasMatch())
-            facts->signalName = match.captured(1);
+        } else {
+            const int number = token.toInt();
+            if (number > 0 && facts->signalNumber > 0 && facts->signalNumber != number)
+                facts->signalDisagreement = true;
+            if (number > 0) {
+                facts->signalNumber = number;
+                facts->signalName.clear();
+            }
+        }
     }
 
     const QRegularExpression generated(QStringLiteral("Core was generated by `([^`]*)'"));
@@ -378,20 +385,40 @@ void absorbGdb(const QString &text, CrashFacts *facts)
         facts->symbolsMissing = true;
     }
 
+    struct FrameChunk
+    {
+        int threadId = -1;
+        bool beforeThreads = false;
+        QVector<StackFrame> frames;
+    };
     const QStringList lines = text.split(QLatin1Char('\n'));
-    QVector<QVector<StackFrame>> chunks;
-    QVector<StackFrame> current;
+    QVector<FrameChunk> chunks;
+    FrameChunk current;
+    current.beforeThreads = true;
     int threads = 0;
+    int currentThreadId = -1;
+    bool seenThread = false;
+    const QRegularExpression currentThreadRe(QStringLiteral("Current thread is\\s+(\\d+)\\b"));
+    const QRegularExpression threadHeaderRe(QStringLiteral("^Thread\\s+(\\d+)\\b"));
     auto flush = [&]() {
-        if (!current.isEmpty())
+        if (!current.frames.isEmpty())
             chunks.append(current);
-        current.clear();
+        current.frames.clear();
+        current.threadId = -1;
+        current.beforeThreads = !seenThread;
     };
     for (const QString &raw : lines) {
         const QString line = raw.trimmed();
-        if (line.startsWith(QLatin1String("Thread "))) {
+        const QRegularExpressionMatch currentThread = currentThreadRe.match(line);
+        if (currentThread.hasMatch())
+            currentThreadId = currentThread.captured(1).toInt();
+        const QRegularExpressionMatch threadHeader = threadHeaderRe.match(line);
+        if (threadHeader.hasMatch()) {
             ++threads;
             flush();
+            seenThread = true;
+            current.threadId = threadHeader.captured(1).toInt();
+            current.beforeThreads = false;
             continue;
         }
         if (!line.startsWith(QLatin1Char('#')))
@@ -399,22 +426,45 @@ void absorbGdb(const QString &text, CrashFacts *facts)
         const StackFrame frame = parseFrameLine(line);
         if (frame.function.isEmpty() && frame.address.isEmpty())
             continue;
+        if (unknownFunction(frame.function) && isNullAddress(frame.address))
+            continue;
         const bool frameZero = line.startsWith(QLatin1String("#0"))
             && (line.size() == 2 || !line.at(2).isDigit());
-        if (!current.isEmpty() && frameZero)
+        if (!current.frames.isEmpty() && frameZero)
             flush();
-        current.append(frame);
+        current.frames.append(frame);
     }
     flush();
     facts->threadCount = threads;
 
-    int best = -1;
+    int chosen = -1;
+    auto longer = [&](int candidate, int incumbent) {
+        if (incumbent < 0)
+            return true;
+        return chunks.at(candidate).frames.size() > chunks.at(incumbent).frames.size();
+    };
     for (int i = 0; i < chunks.size(); ++i) {
-        if (best < 0 || chunks.at(i).size() > chunks.at(best).size())
-            best = i;
+        if (chunks.at(i).beforeThreads && longer(i, chosen))
+            chosen = i;
     }
-    if (best >= 0)
-        facts->frames = chunks.at(best);
+    bool usedCurrent = chosen >= 0;
+    if (chosen < 0 && currentThreadId > 0) {
+        for (int i = 0; i < chunks.size(); ++i) {
+            if (chunks.at(i).threadId == currentThreadId) {
+                chosen = i;
+                usedCurrent = true;
+                break;
+            }
+        }
+    }
+    if (chosen < 0 && !chunks.isEmpty()) {
+        chosen = 0;
+        usedCurrent = threads <= 1;
+    }
+    if (chosen >= 0) {
+        facts->frames = chunks.at(chosen).frames;
+        facts->usedCurrentThread = usedCurrent;
+    }
 
     auto mentions = [](const QString &function, const QStringList &needles) {
         for (const QString &needle : needles) {
@@ -444,14 +494,41 @@ void absorbGdb(const QString &text, CrashFacts *facts)
 
 void finishSignalNames(CrashFacts *facts)
 {
-    if (!facts->signalName.isEmpty() && facts->signalNumber == 0) {
-        if (const SignalPlain *item = signalByName(facts->signalName))
+    if (!facts->signalName.isEmpty()) {
+        if (const SignalPlain *item = signalByName(facts->signalName)) {
+            if (facts->signalNumber > 0 && facts->signalNumber != item->number)
+                facts->signalDisagreement = true;
             facts->signalNumber = item->number;
-    }
-    if (facts->signalName.isEmpty() && facts->signalNumber > 0) {
+        }
+    } else if (facts->signalNumber > 0) {
         if (const SignalPlain *item = signalByNumber(facts->signalNumber))
             facts->signalName = QLatin1String(item->name);
     }
+}
+
+bool sameSymbol(const QString &function, const QString &name)
+{
+    if (function == name)
+        return true;
+    if (function.endsWith(QStringLiteral("::") + name))
+        return true;
+    return function.startsWith(QLatin1String("__")) && function.endsWith(QLatin1Char('_') + name);
+}
+
+bool isSignalMachinery(const QString &function)
+{
+    if (function.contains(QLatin1String("stack_chk_fail"))
+        || function.contains(QLatin1String("__pthread_kill"))) {
+        return true;
+    }
+    const QStringList names = {QStringLiteral("raise"), QStringLiteral("gsignal"),
+                               QStringLiteral("abort"), QStringLiteral("pthread_kill"),
+                               QStringLiteral("__restore_rt"), QStringLiteral("rt_sigreturn")};
+    for (const QString &name : names) {
+        if (sameSymbol(function, name))
+            return true;
+    }
+    return false;
 }
 
 QString whereText(const CrashFacts &facts)
@@ -460,27 +537,48 @@ QString whereText(const CrashFacts &facts)
     if (!facts.programHint.isEmpty())
         parts << QStringLiteral("当时运行的程序是“%1”。").arg(facts.programHint);
     if (facts.threadCount > 1) {
-        parts << QStringLiteral("这份记录里有 %1 条同时在做的事，下面说的是出问题的那一条。")
-                     .arg(facts.threadCount);
+        if (facts.usedCurrentThread) {
+            parts << QStringLiteral("这份记录里有 %1 条同时在做的事，下面说的是触发停止的那一条。")
+                         .arg(facts.threadCount);
+        } else {
+            parts << QStringLiteral("这份记录里有 %1 条同时在做的事。下面列出的是其中一条，不一定是触发停止的那一条。")
+                         .arg(facts.threadCount);
+        }
     }
     if (facts.frames.isEmpty()) {
         parts << QStringLiteral("这次没有得到程序停下前走过的步骤。");
         return parts.join(QString());
     }
-    const StackFrame &top = facts.frames.first();
-    if (unknownFunction(top.function)) {
+    int displayIndex = 0;
+    bool skippedMachinery = false;
+    for (int i = 0; i < facts.frames.size(); ++i) {
+        if (!isSignalMachinery(facts.frames.at(i).function)) {
+            skippedMachinery = i > 0;
+            displayIndex = i;
+            break;
+        }
+    }
+    const StackFrame &top = facts.frames.at(displayIndex);
+    if (facts.executableMismatch && !unknownFunction(top.function)) {
+        parts << QStringLiteral("调试器显示停在“%1”，但填入的程序文件和这份记录对不上，名称可能不准。")
+                     .arg(top.function);
+    } else if (unknownFunction(top.function)) {
         if (top.address.isEmpty())
             parts << QStringLiteral("程序已经停下，但当前看不出停在哪一个步骤。");
         else
             parts << QStringLiteral("程序停在地址 %1，当前看不出步骤名称。").arg(top.address);
+    } else if (skippedMachinery) {
+        parts << QStringLiteral("系统正在处理这次停止，您的程序当时走到的是“%1”这一步。").arg(top.function);
     } else {
         parts << QStringLiteral("程序停在“%1”这一步。").arg(top.function);
-        if (!top.location.isEmpty())
-            parts << QStringLiteral("对应位置：%1。").arg(top.location);
     }
+    if (!unknownFunction(top.function) && !top.location.isEmpty() && !facts.executableMismatch)
+        parts << QStringLiteral("对应位置：%1。").arg(top.location);
+    else if (!unknownFunction(top.function) && !top.location.isEmpty() && facts.executableMismatch)
+        parts << QStringLiteral("调试器给出的位置是 %1，仅供参考。").arg(top.location);
     QStringList earlier;
-    const int limit = std::min(static_cast<int>(facts.frames.size()), 4);
-    for (int i = 1; i < limit; ++i) {
+    const int limit = std::min(facts.frames.size(), displayIndex + 4);
+    for (int i = displayIndex + 1; i < limit; ++i) {
         const QString &name = facts.frames.at(i).function;
         earlier << (unknownFunction(name) ? QStringLiteral("未知步骤") : name);
     }
@@ -537,6 +635,9 @@ QString causeText(const CrashFacts &facts)
     if (facts.executableMismatch) {
         parts << QStringLiteral("填入的程序文件和这份记录对不上，步骤名称可能不准确。");
     }
+    if (facts.signalDisagreement) {
+        parts << QStringLiteral("调试器看到的停止代号和记录里的数字不一致，这里采用调试器的结果。");
+    }
     if (facts.symbolsMissing) {
         parts << QStringLiteral("有些步骤只剩地址、没有名称。若手边有调试符号或未裁剪的程序文件，填上后可以重新分析。");
     }
@@ -549,10 +650,17 @@ QStringList suggestionList(const CrashFacts &facts, bool gdbMissing)
     const SignalPlain *item = signalByName(facts.signalName);
     if (!item && facts.signalNumber > 0)
         item = signalByNumber(facts.signalNumber);
-    if (item)
+    if (facts.signalNumber == 11 && isNullAddress(facts.faultAddress)) {
+        items << QStringLiteral("程序用到了空的位置。请回忆停止前的最后一次操作，并把这份说明交给负责该软件的同事。");
+    } else if (item) {
         items << QString::fromUtf8(item->advice);
-    else
+    } else {
         items << QStringLiteral("请把导出的说明交给负责该软件的同事。");
+    }
+    if (facts.sawStackCheck)
+        items << QStringLiteral("请一并说明：程序写入的内容超出了预留空间。");
+    if (facts.executableMismatch)
+        items << QStringLiteral("请换成生成这份记录时使用的那个程序文件，再分析一次。");
     items << QStringLiteral("请先不要删除这份 core 文件，排查时还需要它。");
     if (facts.symbolsMissing) {
         items << QStringLiteral("如果手边有调试符号或未裁剪的程序文件，填到上方后重新分析，步骤名称会更完整。");
@@ -595,9 +703,19 @@ QString readelfInterpretation(const QString &output, const CrashFacts &facts)
             text += QStringLiteral("。");
         }
         if (isNullAddress(facts.faultAddress))
-            text += QStringLiteral(" si_addr 为 0，表示用到了空的位置。");
+            text += QStringLiteral(" si_addr 或 fault address 为 0，表示用到了空的位置。");
         else if (!facts.faultAddress.isEmpty())
-            text += QStringLiteral(" si_addr 是出问题的位置。");
+            text += QStringLiteral(" si_addr 或 fault address 是出问题的位置。");
+        return text;
+    }
+    if (facts.signoFromNotes) {
+        QString text = QStringLiteral("这条命令没有打印停止代号。本工具改为直接读取文件里的记录，读到的是 %1")
+                           .arg(facts.signalNumber);
+        if (!facts.signalName.isEmpty())
+            text += QStringLiteral("（%1）").arg(facts.signalName);
+        text += QStringLiteral("。");
+        if (isNullAddress(facts.faultAddress))
+            text += QStringLiteral("记录里的位置是空的。");
         return text;
     }
     if (output.contains(QLatin1String("Cannot decode")) || output.contains(QLatin1String("description data"))) {
@@ -606,9 +724,29 @@ QString readelfInterpretation(const QString &output, const CrashFacts &facts)
     return QStringLiteral("这次没有从记录里读出停止代号。若后面的调试器有输出，以调试器为准。");
 }
 
-QString unstripInterpretation()
+QString unstripInterpretation(const QString &output)
 {
-    return QStringLiteral("这个命令用来看程序和它的对照信息是否齐全。缺少对照信息时，仍能判断停止原因，但步骤名称可能只显示为问号。");
+    QString text = QStringLiteral(
+        "这个命令用来看程序和对照信息是否齐全。单独的 “.” 或 “-” 表示没有单独的文件。系统库经常这样，不代表一定看不到步骤名称。");
+    bool missingFile = false;
+    const QStringList lines = output.split(QLatin1Char('\n'));
+    for (const QString &line : lines) {
+        const QStringList parts = line.split(QRegularExpression(QStringLiteral("\\s+")), Qt::SkipEmptyParts);
+        if (parts.size() != 5 || !parts.at(0).contains(QLatin1Char('+')))
+            continue;
+        const QString &name = parts.last();
+        if (name.contains(QLatin1String("linux-vdso")) || name.contains(QLatin1String("linux-gate")))
+            continue;
+        const QString &file = parts.at(2);
+        if (file == QLatin1String("-") || file == QLatin1String("."))
+            missingFile = true;
+    }
+    if (missingFile) {
+        text += QStringLiteral(" 有的程序文件没有找到，步骤名称会更难辨认。");
+    } else {
+        text += QStringLiteral(" 找不到单独的对照文件时，仍能判断停止原因，只是步骤名称可能看不到。");
+    }
+    return text;
 }
 
 QString gdbInterpretation(const CrashFacts &facts)
@@ -624,7 +762,8 @@ QString renderReport(const AnalysisReport &report)
     QString text;
     text += QStringLiteral("文件分析说明\n");
     text += QStringLiteral("生成时间：%1\n").arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
-    text += QStringLiteral("原始命令输出保持英文，是为了和下面的中文释义一一对应。\n\n");
+    text += QStringLiteral("原始命令输出保持英文，是为了和下面的中文释义一一对应。\n");
+    text += QStringLiteral("命令行中的引号只为方便阅读。实际运行时每个参数是分开交给程序的，不会把整行交给命令解释器。\n\n");
 
     text += QStringLiteral("一、结论\n");
     text += QStringLiteral("报错信息：%1\n").arg(report.errorInfo.isEmpty() ? QStringLiteral("无") : report.errorInfo);
@@ -661,6 +800,7 @@ QString renderReport(const AnalysisReport &report)
         for (const QString &limit : report.limits)
             text += QStringLiteral("- %1\n").arg(limit);
     }
+    text += QStringLiteral("补充：建议是按停止原因整理的短句，方便转述，不能代替维护人员的排查。步骤名称需要调试器和符号；输出过长时只保留开头。\n");
     return text;
 }
 
@@ -688,6 +828,189 @@ ToolBins resolveTools(const ToolFinder &finder)
     return bins;
 }
 
+// Linux core 的 note 按 4 字节对齐。64 位 NT_SIGINFO 的故障地址在描述区偏移 16，
+// NT_PRSTATUS 的 cursig 在偏移 12。binutils 的 readelf 常常只打印记录名称、不打印这些数字。
+struct NoteHit
+{
+    int signo = 0;
+    QString faultAddress;
+};
+
+quint16 readNote16(const uchar *data, int offset, int endian)
+{
+    const uchar *p = data + offset;
+    if (endian == 1)
+        return quint16(p[0]) | (quint16(p[1]) << 8);
+    return (quint16(p[0]) << 8) | quint16(p[1]);
+}
+
+quint32 readNote32(const uchar *data, int offset, int endian)
+{
+    const uchar *p = data + offset;
+    if (endian == 1) {
+        return quint32(p[0]) | (quint32(p[1]) << 8) | (quint32(p[2]) << 16) | (quint32(p[3]) << 24);
+    }
+    return (quint32(p[0]) << 24) | (quint32(p[1]) << 16) | (quint32(p[2]) << 8) | quint32(p[3]);
+}
+
+quint64 readNote64(const uchar *data, int offset, int endian)
+{
+    quint64 value = 0;
+    for (int i = 0; i < 8; ++i) {
+        const int shift = endian == 1 ? i * 8 : (7 - i) * 8;
+        value |= quint64(data[offset + i]) << shift;
+    }
+    return value;
+}
+
+bool isFaultSignal(int signo)
+{
+    return signo == 4 || signo == 7 || signo == 8 || signo == 11;
+}
+
+QString formatAddress(quint64 address)
+{
+    return QStringLiteral("0x%1").arg(address, 0, 16);
+}
+
+void walkNotes(const QByteArray &blob, int endian, int elfClass, NoteHit *hit)
+{
+    if (blob.size() < 12)
+        return;
+    const auto *data = reinterpret_cast<const uchar *>(blob.constData());
+    const quint64 size = quint64(blob.size());
+    quint64 pos = 0;
+    int siginfo = 0;
+    int prstatus = 0;
+    QString faultAddress;
+    for (int count = 0; count < 64 && pos + 12 <= size; ++count) {
+        const quint32 namesz = readNote32(data, int(pos), endian);
+        const quint32 descsz = readNote32(data, int(pos) + 4, endian);
+        const quint32 type = readNote32(data, int(pos) + 8, endian);
+        pos += 12;
+        if (quint64(namesz) > size || quint64(descsz) > size)
+            break;
+        const quint64 namePad = (quint64(namesz) + 3u) & ~quint64(3);
+        const quint64 descPad = (quint64(descsz) + 3u) & ~quint64(3);
+        if (pos + namePad > size)
+            break;
+        const quint64 descPos = pos + namePad;
+        if (descPos + descsz > size)
+            break;
+        const uchar *desc = data + descPos;
+        if (type == 0x53494749 && descsz >= 12) {
+            const quint32 signo = readNote32(desc, 0, endian);
+            if (signo > 0 && signo < 64)
+                siginfo = int(signo);
+            if (isFaultSignal(int(signo)) && faultAddress.isEmpty()) {
+                if (elfClass == 2 && descsz >= 24)
+                    faultAddress = formatAddress(readNote64(desc, 16, endian));
+                else if (elfClass == 1 && descsz >= 16)
+                    faultAddress = formatAddress(readNote32(desc, 12, endian));
+            }
+        } else if (type == 1 && descsz >= 14 && prstatus == 0) {
+            const quint32 signo = readNote32(desc, 0, endian);
+            const quint16 cursig = readNote16(desc, 12, endian);
+            int chosen = 0;
+            if (cursig > 0 && cursig < 64)
+                chosen = int(cursig);
+            else if (signo > 0 && signo < 64)
+                chosen = int(signo);
+            if (chosen > 0)
+                prstatus = chosen;
+        }
+        const quint64 next = descPos + descPad;
+        if (next <= pos)
+            break;
+        pos = next;
+    }
+    const int signo = siginfo > 0 ? siginfo : prstatus;
+    if (hit->signo == 0 && signo > 0)
+        hit->signo = signo;
+    if (hit->faultAddress.isEmpty() && !faultAddress.isEmpty())
+        hit->faultAddress = faultAddress;
+}
+
+NoteHit readCoreNotes(const QString &path)
+{
+    NoteHit hit;
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly))
+        return hit;
+    const QByteArray ident = file.read(64);
+    if (ident.size() < 64)
+        return hit;
+    const auto *b = reinterpret_cast<const uchar *>(ident.constData());
+    if (!(b[0] == 0x7f && b[1] == 'E' && b[2] == 'L' && b[3] == 'F'))
+        return hit;
+    const int elfClass = b[4];
+    const int endian = b[5];
+    if ((elfClass != 1 && elfClass != 2) || (endian != 1 && endian != 2))
+        return hit;
+
+    quint64 phoff = 0;
+    int phentsize = 0;
+    int phnum = 0;
+    if (elfClass == 2) {
+        phoff = readNote64(b, 32, endian);
+        phentsize = readNote16(b, 54, endian);
+        phnum = readNote16(b, 56, endian);
+        if (phentsize < 56)
+            return hit;
+    } else {
+        phoff = readNote32(b, 28, endian);
+        phentsize = readNote16(b, 42, endian);
+        phnum = readNote16(b, 44, endian);
+        if (phentsize < 32)
+            return hit;
+    }
+    if (phnum <= 0 || phnum > 512 || phoff == 0 || phentsize > 256)
+        return hit;
+    if (phoff > quint64(file.size()) || !file.seek(qint64(phoff)))
+        return hit;
+    const QByteArray phdrs = file.read(phentsize * phnum);
+    if (phdrs.size() != phentsize * phnum)
+        return hit;
+
+    for (int i = 0; i < phnum; ++i) {
+        const auto *p = reinterpret_cast<const uchar *>(phdrs.constData()) + i * phentsize;
+        const quint32 type = readNote32(p, 0, endian);
+        quint64 offset = 0;
+        quint64 filesz = 0;
+        if (elfClass == 2) {
+            offset = readNote64(p, 8, endian);
+            filesz = readNote64(p, 32, endian);
+        } else {
+            offset = readNote32(p, 4, endian);
+            filesz = readNote32(p, 16, endian);
+        }
+        if (type != 4 || filesz < 12 || offset == 0)
+            continue;
+        if (filesz > 1024u * 1024u)
+            filesz = 1024u * 1024u;
+        if (!file.seek(qint64(offset)))
+            continue;
+        walkNotes(file.read(int(filesz)), endian, elfClass, &hit);
+        if (hit.signo > 0 && !hit.faultAddress.isEmpty())
+            break;
+    }
+    return hit;
+}
+
+void applyCoreNotes(const QString &path, CrashFacts *facts)
+{
+    const NoteHit hit = readCoreNotes(path);
+    if (hit.signo > 0 && facts->signalNumber == 0 && facts->signalName.isEmpty()) {
+        facts->signalNumber = hit.signo;
+        facts->signoFromNotes = true;
+    }
+    if (facts->faultAddress.isEmpty() && !hit.faultAddress.isEmpty()) {
+        const int signo = facts->signalNumber > 0 ? facts->signalNumber : hit.signo;
+        if (isFaultSignal(signo))
+            facts->faultAddress = hit.faultAddress;
+    }
+}
+
 } // namespace
 
 QString CoreAnalyzer::usageGuide()
@@ -704,16 +1027,17 @@ QString CoreAnalyzer::usageGuide()
         "步骤 2  查看停止信号\n"
         "命令：eu-readelf -n -W -- <core 文件>\n"
         "若没有 eu-readelf，可以改用 readelf -n -W -- <core 文件>。\n"
-        "释义：si_signo 或 cursig 后面的数字是停止代号。11 表示访问了不允许使用的内存，6 表示程序自己停了下来。\n"
+        "释义：si_signo、cursig 或 fault address 后面是停止代号和位置。11 表示访问了不允许使用的内存，6 表示程序自己停了下来。\n"
+        "有的 readelf 只列出记录名称、不打印数字。这时仍可从文件记录里直接读出停止代号。\n"
         "\n"
         "步骤 3  核对调试信息\n"
         "命令：eu-unstrip -n --core <core 文件>\n"
         "释义：用来看程序有没有配套的对照信息。没有它也能知道停止原因，只是步骤名称可能看不到。\n"
         "\n"
         "步骤 4  查看停下的步骤\n"
-        "命令：gdb -batch -nx -q -iex \"set pagination off\" -iex \"set confirm off\" <程序文件> <core 文件> -ex \"thread apply all bt\"\n"
-        "没有程序文件时，把 <程序文件> 换成 -c <core 文件>。调试符号若是一个目录，在前面加上 -iex \"set debug-file-directory <目录>\"。\n"
-        "释义：Program terminated with signal 后面是停止原因。以 #0 开头的一行是停下的位置。\n"
+        "命令：gdb -batch -nx -q -iex \"set pagination off\" -iex \"set confirm off\" -iex \"set print frame-arguments none\" <程序文件> <core 文件> -ex \"thread\" -ex \"bt\" -ex \"thread apply all bt\"\n"
+        "没有程序文件时，把 <程序文件> 换成 -c <core 文件>。调试符号若是一个目录，会加上 set debug-file-directory，并保留系统的 /usr/lib/debug。\n"
+        "释义：Program terminated with signal 后面是停止原因。thread 用来确认是哪一条，bt 是这条停下的步骤。以 #0 开头的一行最靠近停止的位置。\n"
         "\n"
         "选好文件后点击“开始分析”，上面的命令会实际执行，并在每条命令下附上本次输出和中文释义。\n");
 }
@@ -850,9 +1174,19 @@ AnalysisReport CoreAnalyzer::analyze(const AnalysisRequest &request,
 
     QStringList gdbArgs = {QStringLiteral("-batch"), QStringLiteral("-nx"), QStringLiteral("-q"),
                            QStringLiteral("-iex"), QStringLiteral("set pagination off"),
-                           QStringLiteral("-iex"), QStringLiteral("set confirm off")};
-    if (symbolIsDir)
-        gdbArgs << QStringLiteral("-iex") << QStringLiteral("set debug-file-directory %1").arg(gdbQuote(symbolPath));
+                           QStringLiteral("-iex"), QStringLiteral("set confirm off"),
+                           QStringLiteral("-iex"), QStringLiteral("set print thread-events off"),
+                           QStringLiteral("-iex"), QStringLiteral("set print frame-arguments none")};
+    if (symbolIsDir) {
+        // 整段作为 gdb 的一个参数，路径不再额外加引号（gdb 会把引号当成目录名的一部分）。
+        // 目录里没有冒号时，把系统的 /usr/lib/debug 留在后面，避免盖掉原来的查找位置。
+        QString directories = symbolPath;
+        const QString systemDir = QStringLiteral("/usr/lib/debug");
+        if (!symbolPath.contains(QLatin1Char(':')) && symbolPath != systemDir)
+            directories += QLatin1Char(':') + systemDir;
+        gdbArgs << QStringLiteral("-iex")
+                << QStringLiteral("set debug-file-directory %1").arg(directories);
+    }
     if (!symbolPath.isEmpty() && !symbolIsDir)
         gdbArgs << QStringLiteral("-s") << symbolPath;
     if (!exePath.isEmpty()) {
@@ -860,7 +1194,9 @@ AnalysisReport CoreAnalyzer::analyze(const AnalysisRequest &request,
     } else {
         gdbArgs << QStringLiteral("-c") << corePath;
     }
-    gdbArgs << QStringLiteral("-ex") << QStringLiteral("thread apply all bt");
+    gdbArgs << QStringLiteral("-ex") << QStringLiteral("thread")
+            << QStringLiteral("-ex") << QStringLiteral("bt")
+            << QStringLiteral("-ex") << QStringLiteral("thread apply all bt");
     ExecutedStep gdbStep;
     gdbStep.title = QStringLiteral("步骤 4  查看程序停在哪一个步骤");
     gdbStep.purpose = QStringLiteral("用调试器打开现场记录，看停止代号和停下前走过的步骤。");
@@ -883,6 +1219,21 @@ AnalysisReport CoreAnalyzer::analyze(const AnalysisRequest &request,
              {QStringLiteral("请重新选择一个存在的 core 文件。")});
         return report;
     }
+    if (!coreInfo.isReadable()) {
+        const QString reason = QStringLiteral("没有权限读取这个文件。");
+        fileStep.statusText = QStringLiteral("未执行：没有读取权限");
+        readelfStep.statusText = QStringLiteral("未执行：没有读取权限");
+        unstripStep.statusText = QStringLiteral("未执行：没有读取权限");
+        gdbStep.statusText = QStringLiteral("未执行：没有读取权限");
+        fileStep.interpretation = QStringLiteral("没有读取权限时不会运行分析命令，也不能据此判断它是不是 core 记录。");
+        report.steps = {fileStep, readelfStep, unstripStep, gdbStep};
+        report.limits = limits;
+        fail(reason,
+             QStringLiteral("读不到内容，所以还不能判断它是不是 core 记录，也不能查看程序为何停止。"),
+             {QStringLiteral("请让文件的所有者允许读取，或换一个当前账户能打开的副本。"),
+              QStringLiteral("请先不要删除原文件。")});
+        return report;
+    }
 
     QString headerDetail;
     const HeaderKind header = readHeader(corePath, &headerDetail);
@@ -897,7 +1248,11 @@ AnalysisReport CoreAnalyzer::analyze(const AnalysisRequest &request,
         limits << QStringLiteral("file 没有跑起来：%1").arg(fileResult.errorDetail);
     if (!fileStep.output.isEmpty())
         absorbFileOutput(fileStep.output, &facts);
-    fileStep.interpretation = fileInterpretation(fileStep.output, report.isCore);
+    if (header == HeaderKind::Unreadable) {
+        fileStep.interpretation = QStringLiteral("文件没有打开成功，不能根据这条输出判断它是不是 core 记录。");
+    } else {
+        fileStep.interpretation = fileInterpretation(fileStep.output, report.isCore);
+    }
     report.steps.append(fileStep);
     if (report.cancelled) {
         readelfStep.statusText = QStringLiteral("未执行：分析已取消");
@@ -909,6 +1264,19 @@ AnalysisReport CoreAnalyzer::analyze(const AnalysisRequest &request,
              QStringLiteral("分析被中途取消。"),
              {QStringLiteral("需要的话可以重新开始。")});
         report.cancelled = true;
+        return report;
+    }
+
+    if (header == HeaderKind::Unreadable) {
+        readelfStep.statusText = QStringLiteral("未执行：文件打不开");
+        unstripStep.statusText = QStringLiteral("未执行：文件打不开");
+        gdbStep.statusText = QStringLiteral("未执行：文件打不开");
+        report.steps << readelfStep << unstripStep << gdbStep;
+        report.limits = limits;
+        fail(headerDetail.isEmpty() ? QStringLiteral("文件打不开。") : headerDetail,
+             QStringLiteral("文件打不开，所以还不能判断程序为何停止。"),
+             {QStringLiteral("请确认文件仍在，并且当前账户可以读取。"),
+              QStringLiteral("请先不要删除原文件。")});
         return report;
     }
 
@@ -931,16 +1299,15 @@ AnalysisReport CoreAnalyzer::analyze(const AnalysisRequest &request,
 
     const CommandResult readelfResult = runOne(bins.readelf, readelfArgs, 20000, &readelfStep);
     if (bins.readelf.isEmpty())
-        limits << QStringLiteral("系统里没有找到 eu-readelf 或 readelf。停止代号改由 gdb 读取。");
+        limits << QStringLiteral("系统里没有找到 eu-readelf 或 readelf。停止代号改为从文件记录或 gdb 读取。");
     else if (readelfResult.status == CommandStatus::FailedToStart || readelfResult.status == CommandStatus::TimedOut)
         limits << QStringLiteral("读取停止代号的命令没有完成：%1").arg(readelfStep.statusText);
     if (!readelfStep.output.isEmpty())
         absorbReadelf(readelfStep.output, &facts);
+    applyCoreNotes(corePath, &facts);
     finishSignalNames(&facts);
-    if (readelfStep.output.contains(QLatin1String("description data"))
-        && !readelfStep.output.contains(QLatin1String("si_signo"))) {
-        readelfStep.output = QStringLiteral("（没有翻译成可读字段，只保留开头）\n")
-            + readelfStep.output.left(600);
+    if (facts.signoFromNotes && !bins.readelf.isEmpty()) {
+        limits << QStringLiteral("读取停止代号的命令没有打印数字，编号是直接从 core 文件的记录里读出的。");
     }
     readelfStep.interpretation = readelfInterpretation(readelfStep.output, facts);
     report.steps.append(readelfStep);
@@ -959,12 +1326,9 @@ AnalysisReport CoreAnalyzer::analyze(const AnalysisRequest &request,
     const CommandResult unstripResult = runOne(bins.unstrip, unstripArgs, 20000, &unstripStep);
     if (bins.unstrip.isEmpty()) {
         limits << QStringLiteral("系统里没有找到 eu-unstrip。没有它也可以继续，只是少一项对照。");
-        unstripStep.interpretation = unstripInterpretation();
+        unstripStep.interpretation = unstripInterpretation(unstripStep.output);
     } else if (unstripResult.status == CommandStatus::Ran) {
-        unstripStep.interpretation = unstripInterpretation();
-        if (unstripStep.output.contains(QLatin1String(" - ")) || unstripStep.output.contains(QLatin1String(" . "))) {
-            unstripStep.interpretation += QStringLiteral(" 输出里的 “-” 或 “.” 表示对应的程序或对照信息缺失。");
-        }
+        unstripStep.interpretation = unstripInterpretation(unstripStep.output);
     } else {
         unstripStep.interpretation = QStringLiteral("这条对照命令没有完成，不影响后面用调试器查看停止原因。");
         limits << QStringLiteral("eu-unstrip 没有完成：%1").arg(unstripStep.statusText);

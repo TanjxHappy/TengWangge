@@ -9,6 +9,18 @@ namespace {
 
 constexpr int kOutputCapBytes = 64 * 1024;
 
+// 按字节截断时丢掉末尾不完整的 UTF-8 续字节，避免报告最后出现乱码。
+QByteArray trimToUtf8Boundary(QByteArray bytes)
+{
+    while (!bytes.isEmpty()) {
+        const unsigned char tail = static_cast<unsigned char>(bytes.at(bytes.size() - 1));
+        if ((tail & 0xC0) != 0x80)
+            break;
+        bytes.chop(1);
+    }
+    return bytes;
+}
+
 QString decodeOutput(const QByteArray &bytes)
 {
     return QString::fromUtf8(bytes);
@@ -38,12 +50,13 @@ CommandResult ProcessExecutor::run(const CommandRequest &request)
     QProcess process;
     process.setProgram(request.program);
     process.setArguments(request.arguments);
-    process.setProcessChannelMode(QProcess::SeparateChannels);
+    // 标准输出和标准错误按出现顺序合在一起，报告里的“关键输出”才和人在终端看到的一致。
+    process.setProcessChannelMode(QProcess::MergedChannels);
     process.setStandardInputFile(QProcess::nullDevice());
     if (!request.workDirectory.isEmpty())
         process.setWorkingDirectory(request.workDirectory);
 
-    // 固定英文消息，避免不同语言的翻译把关键字拆散；编码仍沿用系统环境。
+    // 固定英文消息，避免不同语言的翻译把关键字拆散。去掉 LC_ALL，否则它会盖住 LC_MESSAGES。
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
     env.remove(QStringLiteral("LC_ALL"));
     env.insert(QStringLiteral("LANGUAGE"), QStringLiteral("en"));
@@ -68,15 +81,7 @@ CommandResult ProcessExecutor::run(const CommandRequest &request)
     QByteArray collected;
     bool timedOut = false;
     bool cancelled = false;
-    while (!process.waitForFinished(100)) {
-        collected += process.readAllStandardOutput();
-        collected += process.readAllStandardError();
-        if (collected.size() > kOutputCapBytes) {
-            result.truncated = true;
-            process.kill();
-            process.waitForFinished(2000);
-            break;
-        }
+    while (true) {
         if (m_cancel && m_cancel->load()) {
             cancelled = true;
             process.kill();
@@ -89,11 +94,22 @@ CommandResult ProcessExecutor::run(const CommandRequest &request)
             process.waitForFinished(2000);
             break;
         }
+        const bool finished = process.waitForFinished(100);
+        collected += process.readAllStandardOutput();
+        if (collected.size() > kOutputCapBytes) {
+            result.truncated = true;
+            if (process.state() != QProcess::NotRunning) {
+                process.kill();
+                process.waitForFinished(2000);
+            }
+            break;
+        }
+        if (finished || process.state() == QProcess::NotRunning)
+            break;
     }
     collected += process.readAllStandardOutput();
-    collected += process.readAllStandardError();
     if (collected.size() > kOutputCapBytes) {
-        collected.truncate(kOutputCapBytes);
+        collected = trimToUtf8Boundary(collected.left(kOutputCapBytes));
         result.truncated = true;
     }
     result.output = decodeOutput(collected);

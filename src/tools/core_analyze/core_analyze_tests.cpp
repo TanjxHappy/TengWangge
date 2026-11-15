@@ -2,6 +2,7 @@
 
 #include "core/data_paths.h"
 #include "core/platform_services.h"
+#include "shell/theme.h"
 
 #include <QApplication>
 #include <QDir>
@@ -102,6 +103,76 @@ QString writeFile(const QString &path, const QByteArray &bytes)
     return QFileInfo(path).absoluteFilePath();
 }
 
+void appendU32(QByteArray *out, quint32 value)
+{
+    out->append(char(value & 0xff));
+    out->append(char((value >> 8) & 0xff));
+    out->append(char((value >> 16) & 0xff));
+    out->append(char((value >> 24) & 0xff));
+}
+
+QByteArray coreWithSiginfo(quint32 signo, quint64 address)
+{
+    QByteArray desc(128, '\0');
+    auto put32 = [&](int offset, quint32 value) {
+        desc[offset] = char(value & 0xff);
+        desc[offset + 1] = char((value >> 8) & 0xff);
+        desc[offset + 2] = char((value >> 16) & 0xff);
+        desc[offset + 3] = char((value >> 24) & 0xff);
+    };
+    put32(0, signo);
+    put32(8, 1);
+    for (int i = 0; i < 8; ++i)
+        desc[16 + i] = char((address >> (8 * i)) & 0xff);
+
+    QByteArray note;
+    appendU32(&note, 5);
+    appendU32(&note, quint32(desc.size()));
+    appendU32(&note, 0x53494749);
+    note.append("CORE", 4);
+    note.append('\0');
+    while (note.size() % 4 != 0)
+        note.append('\0');
+    note.append(desc);
+    while (note.size() % 4 != 0)
+        note.append('\0');
+
+    const int phoff = 64;
+    const int noteOff = phoff + 56;
+    QByteArray file(noteOff + note.size(), '\0');
+    file[0] = 0x7f;
+    file[1] = 'E';
+    file[2] = 'L';
+    file[3] = 'F';
+    file[4] = 2;
+    file[5] = 1;
+    file[6] = 1;
+    file[16] = 4;
+    file[18] = 0x3e;
+    file[20] = 1;
+    file[32] = char(phoff);
+    file[52] = 64;
+    file[54] = 56;
+    file[56] = 1;
+    file[64] = 4;
+    file[72] = char(noteOff);
+    const quint64 filesz = quint64(note.size());
+    for (int i = 0; i < 8; ++i)
+        file[96 + i] = char((filesz >> (8 * i)) & 0xff);
+    file[112] = 4;
+    for (int i = 0; i < note.size(); ++i)
+        file[noteOff + i] = note.at(i);
+    return file;
+}
+
+bool widgetInside(QWidget *root, QWidget *child)
+{
+    if (!root || !child || !child->isVisible())
+        return false;
+    const QPoint origin = child->mapTo(root, QPoint(0, 0));
+    return root->rect().contains(QRect(origin, child->size()));
+}
+
 const QString kFileOut = QStringLiteral(
     "ELF 64-bit LSB core file, x86-64, version 1 (SYSV), from 'demo', execfn: '/tmp/demo'");
 const QString kReadelfOut = QStringLiteral(
@@ -190,6 +261,14 @@ private slots:
     void pageShowsScriptedReport();
     void saveReportWritesUtf8();
     void realCoreSampleWhenEnvironmentAllows();
+    void notesSupplySignalWhenReadelfPrintsNoNumber();
+    void readelfNumberWinsOverEmbeddedNotes();
+    void faultAddressWordingFromEuReadelf();
+    void currentThreadBeatsLongerStack();
+    void sigquitUsesPlainLanguage();
+    void unreadableFileIsNotCalledNotACore();
+    void mismatchedExecutableSoftensWhere();
+    void pageKeepsConclusionReportAndExportVisible();
 };
 
 void CoreAnalyzeTests::usageGuideListsCommands()
@@ -327,10 +406,14 @@ void CoreAnalyzeTests::commandsAreArgvNotAShell()
         if (argument.contains(QStringLiteral("debug-file-directory"))) {
             ++directoryArgs;
             QVERIFY(argument.contains(QFileInfo(symbolDir).absoluteFilePath()));
+            QVERIFY(argument.contains(QStringLiteral("/usr/lib/debug")));
+            QVERIFY(!argument.contains(QLatin1Char('"')));
         }
     }
     QCOMPARE(directoryArgs, 1);
     QVERIFY(report.rendered.contains(QLatin1Char('\'')));
+    QVERIFY(gdb->arguments.contains(QStringLiteral("bt")));
+    QVERIFY(gdb->arguments.contains(QStringLiteral("thread")));
 }
 
 void CoreAnalyzeTests::missingGdbStillExplainsSignal()
@@ -473,6 +556,14 @@ void CoreAnalyzeTests::pageShowsScriptedReport()
     QVERIFY(report.contains(QStringLiteral("释义")));
     QVERIFY(report.contains(QStringLiteral("thread apply all bt")));
     QVERIFY(report.contains(QStringLiteral("建议解决方案")));
+    auto *suggestion = harness.page->findChild<QLabel *>(QStringLiteral("suggestionValue"));
+    auto *conclusion = harness.page->findChild<QScrollArea *>(QStringLiteral("conclusionScroll"));
+    QVERIFY(suggestion);
+    QVERIFY(conclusion);
+    const QPoint suggestionTop = suggestion->mapTo(conclusion->viewport(), QPoint(0, 0));
+    const QRect suggestionRect(suggestionTop, suggestion->size());
+    QVERIFY2(conclusion->viewport()->rect().contains(suggestionRect),
+             "典型结论的建议被结论区裁掉了");
     QCOMPARE(harness.platform.status()->current(QStringLiteral("core-analyze")).state, tw::StatusState::Success);
     QVERIFY(!harness.platform.gate()->isLocked());
 }
@@ -597,6 +688,258 @@ void CoreAnalyzeTests::realCoreSampleWhenEnvironmentAllows()
             || report.rendered.contains(QStringLiteral("SIGSEGV")));
     if (!QStandardPaths::findExecutable(QStringLiteral("gdb")).isEmpty())
         QVERIFY(report.whereInfo.contains(QStringLiteral("main")) || report.rendered.contains(QStringLiteral("main")));
+}
+
+void CoreAnalyzeTests::notesSupplySignalWhenReadelfPrintsNoNumber()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeFile(dir.filePath(QStringLiteral("demo.core")), coreWithSiginfo(11, 0));
+    ScriptedExecutor exec;
+    exec.byBase.insert(QStringLiteral("file"), ran(kFileOut));
+    exec.byBase.insert(QStringLiteral("readelf"), ran(QStringLiteral(
+        "CORE 0x150 NT_PRSTATUS (prstatus structure)\n"
+        "CORE 0x80 NT_SIGINFO (siginfo_t data)\n"
+        "Cannot decode 64-bit note in 32-bit build\n"
+        "description data: 0b 00 00 00\n")));
+    auto finder = [](const QString &name) {
+        if (name == QLatin1String("file") || name == QLatin1String("readelf"))
+            return QStringLiteral("/usr/bin/") + name;
+        return QString();
+    };
+    tw::AnalysisRequest request;
+    request.corePath = path;
+    const tw::AnalysisReport report = tw::CoreAnalyzer::analyze(request, exec, finder);
+    QVERIFY(report.ok);
+    QCOMPARE(report.signalNumber, 11);
+    QCOMPARE(report.signalName, QStringLiteral("SIGSEGV"));
+    QVERIFY(report.errorInfo.contains(QStringLiteral("不允许使用的内存")));
+    QVERIFY(report.cause.contains(QStringLiteral("空")));
+    QVERIFY(report.rendered.contains(QStringLiteral("直接读取文件里的记录")));
+    QVERIFY(report.rendered.contains(QStringLiteral("description data")));
+    bool sawReadelf = false;
+    for (const tw::CommandRequest &call : exec.calls) {
+        const QString base = QFileInfo(call.program).fileName();
+        QVERIFY(base != QStringLiteral("gdb"));
+        QVERIFY(base != QStringLiteral("eu-readelf"));
+        if (base == QStringLiteral("readelf"))
+            sawReadelf = true;
+    }
+    QVERIFY(sawReadelf);
+}
+
+void CoreAnalyzeTests::readelfNumberWinsOverEmbeddedNotes()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeFile(dir.filePath(QStringLiteral("demo.core")), coreWithSiginfo(11, 0));
+    ScriptedExecutor exec;
+    exec.byBase.insert(QStringLiteral("file"), ran(kFileOut));
+    exec.byBase.insert(QStringLiteral("eu-readelf"), ran(QStringLiteral("cursig: 6\n")));
+    tw::AnalysisRequest request;
+    request.corePath = path;
+    const tw::AnalysisReport report = tw::CoreAnalyzer::analyze(request, exec, presentTools());
+    QCOMPARE(report.signalNumber, 6);
+    QCOMPARE(report.signalName, QStringLiteral("SIGABRT"));
+    QVERIFY(report.errorInfo.contains(QStringLiteral("自己停了下来")));
+    QVERIFY(!report.cause.contains(QStringLiteral("空")));
+    QVERIFY(!report.rendered.contains(QStringLiteral("直接读取文件里的记录")));
+}
+
+void CoreAnalyzeTests::faultAddressWordingFromEuReadelf()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeFile(dir.filePath(QStringLiteral("demo.core")), elfHeader(4));
+    ScriptedExecutor exec;
+    exec.byBase.insert(QStringLiteral("file"), ran(kFileOut));
+    exec.byBase.insert(QStringLiteral("eu-readelf"), ran(QStringLiteral(
+        "info.si_signo: 11, info.si_code: 1, info.si_errno: 0, cursig: 11\n"
+        "fault address: 0\n")));
+    tw::AnalysisRequest request;
+    request.corePath = path;
+    const tw::AnalysisReport report = tw::CoreAnalyzer::analyze(request, exec, presentTools());
+    QCOMPARE(report.signalNumber, 11);
+    QVERIFY(report.cause.contains(QStringLiteral("空")));
+    QVERIFY(report.rendered.contains(QStringLiteral("fault address")));
+}
+
+void CoreAnalyzeTests::currentThreadBeatsLongerStack()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeFile(dir.filePath(QStringLiteral("demo.core")), elfHeader(4));
+    ScriptedExecutor exec;
+    fillCrashOutputs(&exec);
+    exec.byBase.insert(QStringLiteral("gdb"), ran(QStringLiteral(
+        "Program terminated with signal SIGSEGV, Segmentation fault.\n"
+        "#0  0x401000 in worker () at worker.c:9\n"
+        "#1  0x402000 in main () at main.c:3\n"
+        "[Current thread is 2 (LWP 99)]\n"
+        "Thread 1 (LWP 10):\n"
+        "#0  0x1 in deep1 () at a.c:1\n"
+        "#1  0x2 in deep2 () at a.c:2\n"
+        "#2  0x3 in deep3 () at a.c:3\n"
+        "#3  0x4 in deep4 () at a.c:4\n"
+        "#4  0x5 in deep5 () at a.c:5\n"
+        "#5  0x6 in deep6 () at a.c:6\n"
+        "Thread 2 (LWP 99):\n"
+        "#0  0x401000 in worker () at worker.c:9\n"
+        "#1  0x402000 in main () at main.c:3\n")));
+    tw::AnalysisRequest request;
+    request.corePath = path;
+    const tw::AnalysisReport report = tw::CoreAnalyzer::analyze(request, exec, presentTools());
+    QVERIFY(report.whereInfo.contains(QStringLiteral("worker")));
+    QVERIFY(report.whereInfo.contains(QStringLiteral("触发停止")));
+    QVERIFY(!report.whereInfo.contains(QStringLiteral("deep6")));
+}
+
+void CoreAnalyzeTests::sigquitUsesPlainLanguage()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeFile(dir.filePath(QStringLiteral("demo.core")), elfHeader(4));
+    ScriptedExecutor exec;
+    fillCrashOutputs(&exec);
+    exec.byBase.insert(QStringLiteral("eu-readelf"), ran(QStringLiteral("cursig: 3\n")));
+    exec.byBase.insert(QStringLiteral("gdb"), ran(QStringLiteral(
+        "Program terminated with signal SIGQUIT, Quit.\n"
+        "#0  0x401000 in main () at q.c:1\n")));
+    tw::AnalysisRequest request;
+    request.corePath = path;
+    const tw::AnalysisReport report = tw::CoreAnalyzer::analyze(request, exec, presentTools());
+    QCOMPARE(report.signalNumber, 3);
+    QCOMPARE(report.signalName, QStringLiteral("SIGQUIT"));
+    QVERIFY(report.errorInfo.contains(QStringLiteral("退出请求")));
+    QVERIFY(report.suggestionText.contains(QStringLiteral("不要删除")));
+}
+
+void CoreAnalyzeTests::unreadableFileIsNotCalledNotACore()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeFile(dir.filePath(QStringLiteral("hidden.core")), coreWithSiginfo(11, 0));
+    QVERIFY(QFile::setPermissions(path, QFileDevice::WriteOwner));
+    struct RestorePermissions {
+        QString path;
+        ~RestorePermissions()
+        {
+            QFile::setPermissions(path, QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        }
+    } restore{path};
+    if (QFileInfo(path).isReadable())
+        QSKIP("当前账户即使去掉读权限也能读取");
+
+    ScriptedExecutor exec;
+    exec.byBase.insert(QStringLiteral("file"), ran(QStringLiteral("ELF 64-bit LSB core file")));
+    tw::AnalysisRequest request;
+    request.corePath = path;
+    const tw::AnalysisReport report = tw::CoreAnalyzer::analyze(request, exec, presentTools());
+    QVERIFY(!report.ok);
+    QVERIFY(report.errorInfo.contains(QStringLiteral("没有权限")));
+    QVERIFY(!report.errorInfo.contains(QStringLiteral("不是 Linux core")));
+    QVERIFY(exec.calls.isEmpty());
+    QVERIFY(report.rendered.contains(QStringLiteral("未执行")));
+}
+
+void CoreAnalyzeTests::mismatchedExecutableSoftensWhere()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeFile(dir.filePath(QStringLiteral("demo.core")), elfHeader(4));
+    ScriptedExecutor exec;
+    fillCrashOutputs(&exec);
+    exec.byBase.insert(QStringLiteral("gdb"), ran(QStringLiteral(
+        "warning: core file may not match specified executable file.\n"
+        "Program terminated with signal SIGSEGV, Segmentation fault.\n"
+        "#0  0x401000 in imagined () at no.c:1\n")));
+    tw::AnalysisRequest request;
+    request.corePath = path;
+    request.executablePath = QStringLiteral("/bin/true");
+    const tw::AnalysisReport report = tw::CoreAnalyzer::analyze(request, exec, presentTools());
+    QVERIFY(report.whereInfo.contains(QStringLiteral("对不上")));
+    QVERIFY(report.whereInfo.contains(QStringLiteral("imagined")));
+    QVERIFY(report.suggestionText.contains(QStringLiteral("再分析一次")));
+}
+
+void CoreAnalyzeTests::pageKeepsConclusionReportAndExportVisible()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = writeFile(dir.filePath(QStringLiteral("demo.core")), elfHeader(4));
+    PageHarness harness(dir.filePath(QStringLiteral("data")));
+    QVERIFY(harness.initialized);
+    harness.page->setStyleSheet(tw::Theme::workbench().styleSheet());
+    harness.page->resize(980, 640);
+    harness.page->show();
+    QApplication::processEvents();
+
+    auto *exportButton = harness.page->findChild<QPushButton *>(QStringLiteral("exportButton"));
+    auto *report = harness.page->findChild<QPlainTextEdit *>(QStringLiteral("reportView"));
+    auto *conclusion = harness.page->findChild<QScrollArea *>(QStringLiteral("conclusionScroll"));
+    QVERIFY(exportButton);
+    QVERIFY(report);
+    QVERIFY(conclusion);
+    const auto topInPage = [&](QWidget *widget) {
+        return widget->mapTo(harness.page, QPoint(0, 0)).y();
+    };
+    QVERIFY2(widgetInside(harness.page, exportButton), "导出按钮不在 1180x760 对应的页面里");
+    QVERIFY2(widgetInside(harness.page, conclusion), "结论区不在页面里");
+    QVERIFY2(widgetInside(harness.page, report), "分析说明不在页面里");
+    QVERIFY(report->height() >= 100);
+    QVERIFY(topInPage(exportButton) < topInPage(conclusion));
+    QVERIFY(topInPage(conclusion) < topInPage(report));
+
+    harness.page->setFinderForTest(presentTools());
+    harness.page->setExecutorFactoryForTest([](std::atomic<bool> *cancel) {
+        auto exec = std::make_unique<ScriptedExecutor>();
+        exec->cancel = cancel;
+        fillCrashOutputs(exec.get());
+        return exec;
+    });
+    harness.page->findChild<QLineEdit *>(QStringLiteral("corePath"))->setText(path);
+    harness.page->findChild<QPushButton *>(QStringLiteral("startButton"))->click();
+    auto *error = harness.page->findChild<QLabel *>(QStringLiteral("errorValue"));
+    QTRY_VERIFY_WITH_TIMEOUT(error->text().contains(QStringLiteral("不允许使用的内存")), 5000);
+    harness.page->resize(980, 640);
+    QApplication::processEvents();
+    auto *suggestion = harness.page->findChild<QLabel *>(QStringLiteral("suggestionValue"));
+    const QPoint suggestionTop = suggestion->mapTo(conclusion->viewport(), QPoint(0, 0));
+    QVERIFY2(conclusion->viewport()->rect().contains(QRect(suggestionTop, suggestion->size())),
+             "1180x760 下正常结论的建议没有完整显示");
+    QVERIFY2(widgetInside(harness.page, exportButton), "正常结论把导出按钮挤出了页面");
+    QVERIFY2(widgetInside(harness.page, report), "正常结论把分析说明挤出了页面");
+    QVERIFY(report->height() >= 100);
+    shot(harness.page, QStringLiteral("core-analyze-normal"));
+
+    const QString longName(360, QLatin1Char('N'));
+    harness.page->setExecutorFactoryForTest([longName](std::atomic<bool> *cancel) {
+        auto exec = std::make_unique<ScriptedExecutor>();
+        exec->cancel = cancel;
+        fillCrashOutputs(exec.get());
+        exec->byBase.insert(QStringLiteral("gdb"), ran(
+            QStringLiteral("Program terminated with signal SIGSEGV, Segmentation fault.\n#0  0x401000 in ")
+            + longName + QStringLiteral(" () at /tmp/very/long/path/crash.c:7\n")));
+        exec->byBase.insert(QStringLiteral("file"), ran(
+            QStringLiteral("ELF 64-bit LSB core file, from 'demo', execfn: '/tmp/")
+            + longName + QStringLiteral("'\n")));
+        return exec;
+    });
+    harness.page->findChild<QLineEdit *>(QStringLiteral("corePath"))->setText(path);
+    harness.page->findChild<QPushButton *>(QStringLiteral("startButton"))->click();
+    auto *where = harness.page->findChild<QLabel *>(QStringLiteral("whereValue"));
+    QTRY_VERIFY_WITH_TIMEOUT(where->text().contains(longName.left(12)), 5000);
+    QApplication::processEvents();
+    harness.page->resize(980, 640);
+    QApplication::processEvents();
+
+    QVERIFY2(widgetInside(harness.page, exportButton), "长结论把导出按钮挤出了页面");
+    QVERIFY2(widgetInside(harness.page, conclusion), "长结论把结论区挤出了页面");
+    QVERIFY2(widgetInside(harness.page, report), "长结论把分析说明挤出了页面");
+    QVERIFY(report->height() >= 100);
+    QVERIFY(conclusion->height() <= 248);
+    QVERIFY(exportButton->isEnabled());
+    shot(harness.page, QStringLiteral("core-analyze-fit"));
 }
 
 QTEST_MAIN(CoreAnalyzeTests)
