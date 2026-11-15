@@ -57,8 +57,9 @@ QStringList matchedKeywords(const QStringList &keywords, const QString &relative
                             const QString &fileName);
 
 // 递归扫描 rootPath 下的普通文件和指向文件的符号链接。
-// 不进入指向起始目录之外的链接，不用目录符号链接展开出第二套路径，并用 inode 挡住循环。
-// progress 在调用方线程上执行，可以为空。
+// 子目录用 openat(O_NOFOLLOW) 打开，不进入指向起始目录之外的链接，
+// 不用目录符号链接展开出第二套路径，并用 inode 挡住循环。
+// progress 在调用 scanDirectory 的线程上执行，可以为空；不要在其中直接改界面。
 FilterScanResult scanDirectory(const QString &rootPath, const QStringList &keywords,
                                const std::atomic<bool> &cancel,
                                const std::function<void(int files, int problems)> &progress);

@@ -12,15 +12,47 @@
 #include <dirent.h>
 
 #include <algorithm>
-#include <system_error>
+#include <cerrno>
 #include <utility>
+#include <vector>
 
 namespace tw {
 namespace {
 
-QString errnoText(int err)
+constexpr int kProgressStride = 64;
+
+QString ioError(int err)
 {
-    return QString::fromStdString(std::generic_category().message(err));
+    switch (err) {
+    case EACCES:
+    case EPERM:
+        return QStringLiteral("没有权限");
+    case ENOENT:
+        return QStringLiteral("找不到");
+    case ENOTDIR:
+        return QStringLiteral("路径中有一项不是目录");
+    case ELOOP:
+        return QStringLiteral("符号链接层数过多");
+    case ENAMETOOLONG:
+        return QStringLiteral("路径过长");
+    case EROFS:
+        return QStringLiteral("目录是只读的");
+    case EBUSY:
+        return QStringLiteral("文件正在使用");
+    case EIO:
+        return QStringLiteral("读写出错");
+    case ENOSPC:
+        return QStringLiteral("磁盘空间不足");
+    case EMFILE:
+    case ENFILE:
+        return QStringLiteral("同时打开的项目过多");
+    case EISDIR:
+        return QStringLiteral("这是一个目录");
+    case EINVAL:
+        return QStringLiteral("路径无效");
+    default:
+        return QStringLiteral("系统未能完成（错误码 %1）").arg(err);
+    }
 }
 
 QString visitKey(const struct stat &st)
@@ -114,7 +146,46 @@ private:
     DIR *m_dir = nullptr;
 };
 
-QString unlinkInside(const QString &rootClean, const QString &absolutePath)
+// 复制目录描述符后再交给 fdopendir，原描述符继续用于 openat / fstatat。
+QStringList listDirectoryNames(int fd, QString *error)
+{
+    error->clear();
+    const int copy = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (copy < 0) {
+        *error = QStringLiteral("无法读取目录：%1").arg(ioError(errno));
+        return {};
+    }
+    DIR *raw = ::fdopendir(copy);
+    if (!raw) {
+        const int err = errno;
+        ::close(copy);
+        *error = QStringLiteral("无法读取目录：%1").arg(ioError(err));
+        return {};
+    }
+    DirectoryHandle handle(raw);
+    QStringList names;
+    while (true) {
+        errno = 0;
+        dirent *entry = ::readdir(handle.get());
+        if (!entry) {
+            if (errno != 0) {
+                *error = QStringLiteral("无法读取目录：%1").arg(ioError(errno));
+                names.clear();
+            }
+            break;
+        }
+        const QString name = QFile::decodeName(entry->d_name);
+        if (name == QLatin1String(".") || name == QLatin1String(".."))
+            continue;
+        names.append(name);
+    }
+    std::sort(names.begin(), names.end(), [](const QString &left, const QString &right) {
+        return QString::compare(left, right, Qt::CaseSensitive) < 0;
+    });
+    return names;
+}
+
+QString unlinkInside(int rootFd, const QString &rootClean, const QString &absolutePath)
 {
     const QString clean = QDir::cleanPath(absolutePath.trimmed());
     if (clean.isEmpty() || clean == rootClean)
@@ -138,12 +209,10 @@ QString unlinkInside(const QString &rootClean, const QString &absolutePath)
             return QStringLiteral("路径不在所选目录内");
     }
 
-    FileDescriptor rootFd(::open(QFile::encodeName(rootClean).constData(),
-                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC));
-    if (!rootFd)
-        return QStringLiteral("无法打开目录：%1").arg(errnoText(errno));
+    if (rootFd < 0)
+        return QStringLiteral("无法打开目录：没有权限");
 
-    int current = rootFd.get();
+    int current = rootFd;
     FileDescriptor nested;
     for (int i = 0; i < parts.size() - 1; ++i) {
         const QByteArray name = QFile::encodeName(parts.at(i));
@@ -161,8 +230,8 @@ QString unlinkInside(const QString &rootClean, const QString &absolutePath)
             if (err == ENOENT)
                 return QStringLiteral("文件已不存在");
             if (err == ENOTDIR)
-                return QStringLiteral("路径中间项不是目录，已拒绝");
-            return QStringLiteral("删除失败：%1").arg(errnoText(err));
+                return QStringLiteral("路径中间有一项不是目录，已拒绝删除");
+            return QStringLiteral("删除失败：%1").arg(ioError(err));
         }
         nested.reset(next);
         current = next;
@@ -174,16 +243,52 @@ QString unlinkInside(const QString &rootClean, const QString &absolutePath)
         const int err = errno;
         if (err == ENOENT)
             return QStringLiteral("文件已不存在");
-        return QStringLiteral("无法读取：%1").arg(errnoText(err));
+        return QStringLiteral("无法读取：%1").arg(ioError(err));
     }
     if (S_ISDIR(st.st_mode))
         return QStringLiteral("拒绝删除目录");
     if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode))
-        return QStringLiteral("拒绝删除该类型的文件");
-    if (::unlinkat(current, base.constData(), 0) != 0)
-        return QStringLiteral("删除失败：%1").arg(errnoText(errno));
+        return QStringLiteral("这不是普通文件，已拒绝删除");
+    if (::unlinkat(current, base.constData(), 0) != 0) {
+        const int err = errno;
+        if (err == EISDIR)
+            return QStringLiteral("拒绝删除目录");
+        if (err == EACCES || err == EPERM)
+            return QStringLiteral("删除失败：没有权限");
+        if (err == EROFS)
+            return QStringLiteral("删除失败：目录是只读的");
+        return QStringLiteral("删除失败：%1").arg(ioError(err));
+    }
     return {};
 }
+
+QStringList matchAgainst(const QStringList &keywords, const QStringList &folded,
+                         const QString &relativePath, const QString &fileName)
+{
+    const QString path = QDir::fromNativeSeparators(relativePath).toCaseFolded();
+    const QString name = fileName.toCaseFolded();
+    QStringList hits;
+    const int count = qMin(keywords.size(), folded.size());
+    for (int i = 0; i < count; ++i) {
+        const QString &needle = folded.at(i);
+        if (needle.isEmpty())
+            continue;
+        if (path.contains(needle) || name.contains(needle))
+            hits.append(keywords.at(i));
+    }
+    return hits;
+}
+
+struct ScanFrame
+{
+    QString absolutePath;
+    QString relativePath;
+    FileDescriptor fd;
+    QStringList names;
+    QStringList subdirs;
+    int phase = 0;
+    int subdirIndex = 0;
+};
 
 } // namespace
 
@@ -212,17 +317,11 @@ QStringList parseKeywords(const QString &text)
 QStringList matchedKeywords(const QStringList &keywords, const QString &relativePath,
                             const QString &fileName)
 {
-    const QString path = QDir::fromNativeSeparators(relativePath).toCaseFolded();
-    const QString name = fileName.toCaseFolded();
-    QStringList hits;
-    for (const QString &keyword : keywords) {
-        const QString folded = keyword.toCaseFolded();
-        if (folded.isEmpty())
-            continue;
-        if (path.contains(folded) || name.contains(folded))
-            hits.append(keyword);
-    }
-    return hits;
+    QStringList folded;
+    folded.reserve(keywords.size());
+    for (const QString &keyword : keywords)
+        folded.append(keyword.toCaseFolded());
+    return matchAgainst(keywords, folded, relativePath, fileName);
 }
 
 FilterScanResult scanDirectory(const QString &rootPath, const QStringList &keywords,
@@ -259,124 +358,195 @@ FilterScanResult scanDirectory(const QString &rootPath, const QStringList &keywo
     if (rootCanonical == QLatin1String("/"))
         return fail(QStringLiteral("不能选择文件系统根目录"));
 
+    // 只跟随用户选中的这一层。子目录一律 O_NOFOLLOW，避免扫描过程中被换成外部链接。
+    FileDescriptor rootFd(::open(QFile::encodeName(clean).constData(),
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!rootFd)
+        return fail(QStringLiteral("无法读取该目录：%1").arg(ioError(errno)));
+
     struct stat rootStat;
-    if (::stat(QFile::encodeName(clean).constData(), &rootStat) != 0)
-        return fail(QStringLiteral("无法读取该目录：%1").arg(errnoText(errno)));
+    if (::fstat(rootFd.get(), &rootStat) != 0)
+        return fail(QStringLiteral("无法读取该目录：%1").arg(ioError(errno)));
     if (!S_ISDIR(rootStat.st_mode))
         return fail(QStringLiteral("路径不是目录：%1").arg(clean));
 
     QSet<QString> visited;
     visited.insert(visitKey(rootStat));
 
-    QVector<QString> directories;
-    directories.append(clean);
+    QStringList foldedKeywords;
+    foldedKeywords.reserve(keywords.size());
+    for (const QString &keyword : keywords)
+        foldedKeywords.append(keyword.toCaseFolded());
 
-    auto addProblem = [&result](const QString &path, const QString &reason) {
+    auto addProblem = [&result, &progress](const QString &path, const QString &reason) {
         result.problems.append(FilterProblem{path, reason});
+        const int count = result.problems.size();
+        if (count == 1 || count % kProgressStride == 0)
+            notify(progress, result.files.size(), count);
     };
-    auto addFile = [&](const QString &absolutePath) {
+    auto addFile = [&](const QString &absolutePath, const QString &relativePath, const QString &fileName) {
         FilterFileRow row;
         row.absolutePath = absolutePath;
-        row.relativePath = QDir::fromNativeSeparators(QDir(clean).relativeFilePath(absolutePath));
-        row.fileName = QFileInfo(absolutePath).fileName();
-        row.matchedTerms = matchedKeywords(keywords, row.relativePath, row.fileName);
+        row.relativePath = relativePath;
+        row.fileName = fileName;
+        row.matchedTerms = matchAgainst(keywords, foldedKeywords, relativePath, fileName);
         row.matched = !row.matchedTerms.isEmpty();
         result.files.append(row);
         const int count = result.files.size();
-        if (count == 1 || count % 32 == 0)
+        if (count == 1 || count % kProgressStride == 0)
             notify(progress, count, result.problems.size());
     };
 
-    for (int index = 0; index < directories.size(); ++index) {
+    QString listError;
+    QStringList rootNames = listDirectoryNames(rootFd.get(), &listError);
+    if (!listError.isEmpty())
+        return fail(listError);
+
+    ScanFrame rootFrame;
+    rootFrame.absolutePath = clean;
+    rootFrame.fd = std::move(rootFd);
+    rootFrame.names = std::move(rootNames);
+    std::vector<ScanFrame> stack;
+    stack.push_back(std::move(rootFrame));
+
+    while (!stack.empty()) {
         if (cancel.load()) {
             result.cancelled = true;
             result.files.clear();
             return result;
         }
 
-        const QString dirPath = directories.at(index);
-        DirectoryHandle handle(::opendir(QFile::encodeName(dirPath).constData()));
-        if (!handle) {
-            const QString reason = QStringLiteral("无法读取目录：%1").arg(errnoText(errno));
-            addProblem(dirPath, reason);
-            if (index == 0) {
-                result.error = reason;
-                return result;
+        ScanFrame &frame = stack.back();
+        if (frame.phase == 0) {
+            // 先分完本层，再进入子目录。这样指向尚未扫描的同级目录的链接不会被误当成循环。
+            for (const QString &name : frame.names) {
+                if (cancel.load()) {
+                    result.cancelled = true;
+                    result.files.clear();
+                    return result;
+                }
+                const QByteArray encoded = QFile::encodeName(name);
+                const QString childAbsolute = frame.absolutePath + QLatin1Char('/') + name;
+                const QString childRelative = frame.relativePath.isEmpty()
+                    ? name
+                    : frame.relativePath + QLatin1Char('/') + name;
+                struct stat st;
+                if (::fstatat(frame.fd.get(), encoded.constData(), &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                    addProblem(childAbsolute, QStringLiteral("无法读取这一项：%1").arg(ioError(errno)));
+                    continue;
+                }
+
+                if (S_ISLNK(st.st_mode)) {
+                    struct stat target;
+                    if (::fstatat(frame.fd.get(), encoded.constData(), &target, 0) != 0) {
+                        const int err = errno;
+                        if (err == ENOENT)
+                            addProblem(childAbsolute, QStringLiteral("符号链接已损坏，目标不存在"));
+                        else if (err == ELOOP)
+                            addProblem(childAbsolute, QStringLiteral("符号链接形成循环，已跳过"));
+                        else
+                            addProblem(childAbsolute,
+                                       QStringLiteral("无法读取符号链接目标：%1").arg(ioError(err)));
+                        continue;
+                    }
+                    if (S_ISDIR(target.st_mode)) {
+                        const QString canonical = QFileInfo(childAbsolute).canonicalFilePath();
+                        if (canonical.isEmpty() || !canonicalInside(canonical, rootCanonical))
+                            addProblem(childAbsolute, QStringLiteral("符号链接指向起始目录之外，已跳过"));
+                        else if (visited.contains(visitKey(target)))
+                            addProblem(childAbsolute, QStringLiteral("符号链接形成循环，已跳过"));
+                        else
+                            addProblem(childAbsolute, QStringLiteral("目录符号链接指向目录内部，未跟随"));
+                        continue;
+                    }
+                    if (S_ISREG(target.st_mode)) {
+                        addFile(childAbsolute, childRelative, name);
+                        continue;
+                    }
+                    addProblem(childAbsolute, QStringLiteral("符号链接目标不是普通文件，已跳过"));
+                    continue;
+                }
+
+                if (S_ISDIR(st.st_mode)) {
+                    if (visited.contains(visitKey(st)))
+                        addProblem(childAbsolute, QStringLiteral("检测到目录循环，已跳过"));
+                    else
+                        frame.subdirs.append(name);
+                    continue;
+                }
+
+                if (S_ISREG(st.st_mode)) {
+                    addFile(childAbsolute, childRelative, name);
+                    continue;
+                }
+                addProblem(childAbsolute, QStringLiteral("不是普通文件，已跳过"));
+            }
+            frame.phase = 1;
+            continue;
+        }
+
+        if (frame.subdirIndex >= frame.subdirs.size()) {
+            stack.pop_back();
+            continue;
+        }
+
+        const QString subName = frame.subdirs.at(frame.subdirIndex++);
+        const int parentFd = frame.fd.get();
+        const QString parentAbsolute = frame.absolutePath;
+        const QString parentRelative = frame.relativePath;
+        const QString childAbsolute = parentAbsolute + QLatin1Char('/') + subName;
+        const QString childRelative = parentRelative.isEmpty()
+            ? subName
+            : parentRelative + QLatin1Char('/') + subName;
+        const QByteArray encoded = QFile::encodeName(subName);
+
+        FileDescriptor childFd(::openat(parentFd, encoded.constData(),
+                                         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        if (!childFd) {
+            const int err = errno;
+            struct stat now;
+            if (::fstatat(parentFd, encoded.constData(), &now, AT_SYMLINK_NOFOLLOW) == 0
+                && S_ISLNK(now.st_mode)) {
+                addProblem(childAbsolute, QStringLiteral("这项在扫描时变成了符号链接，已跳过"));
+            } else {
+                addProblem(childAbsolute, QStringLiteral("无法读取目录：%1").arg(ioError(err)));
             }
             continue;
         }
 
-        QStringList names;
-        while (dirent *entry = ::readdir(handle.get())) {
-            const QString name = QFile::decodeName(entry->d_name);
-            if (name == QLatin1String(".") || name == QLatin1String(".."))
-                continue;
-            names.append(name);
+        struct stat opened;
+        if (::fstat(childFd.get(), &opened) != 0) {
+            addProblem(childAbsolute, QStringLiteral("无法读取目录：%1").arg(ioError(errno)));
+            continue;
         }
-        std::sort(names.begin(), names.end(), [](const QString &left, const QString &right) {
-            return QString::compare(left, right, Qt::CaseSensitive) < 0;
-        });
-
-        for (const QString &name : names) {
-            if (cancel.load()) {
-                result.cancelled = true;
-                result.files.clear();
-                return result;
-            }
-
-            const QString childPath = QDir::cleanPath(QDir(dirPath).filePath(name));
-            struct stat st;
-            if (::lstat(QFile::encodeName(childPath).constData(), &st) != 0) {
-                addProblem(childPath, QStringLiteral("无法读取：%1").arg(errnoText(errno)));
-                continue;
-            }
-
-            if (S_ISLNK(st.st_mode)) {
-                struct stat target;
-                if (::stat(QFile::encodeName(childPath).constData(), &target) != 0) {
-                    addProblem(childPath, QStringLiteral("无法读取符号链接目标"));
-                    continue;
-                }
-                const QString canonical = QFileInfo(childPath).canonicalFilePath();
-                if (S_ISDIR(target.st_mode)) {
-                    if (canonical.isEmpty() || !canonicalInside(canonical, rootCanonical))
-                        addProblem(childPath, QStringLiteral("符号链接指向起始目录之外，已跳过"));
-                    else if (visited.contains(visitKey(target)))
-                        addProblem(childPath, QStringLiteral("符号链接形成循环，已跳过"));
-                    else
-                        addProblem(childPath, QStringLiteral("目录符号链接指向目录内部，未跟随"));
-                    continue;
-                }
-                if (S_ISREG(target.st_mode)) {
-                    addFile(childPath);
-                    continue;
-                }
-                addProblem(childPath, QStringLiteral("符号链接目标不是普通文件，已跳过"));
-                continue;
-            }
-
-            if (S_ISDIR(st.st_mode)) {
-                const QString key = visitKey(st);
-                if (visited.contains(key)) {
-                    addProblem(childPath, QStringLiteral("检测到目录循环，已跳过"));
-                    continue;
-                }
-                const QString canonical = QFileInfo(childPath).canonicalFilePath();
-                if (!canonicalInside(canonical, rootCanonical)) {
-                    addProblem(childPath, QStringLiteral("目录超出起始范围，已跳过"));
-                    continue;
-                }
-                visited.insert(key);
-                directories.append(childPath);
-                continue;
-            }
-
-            if (S_ISREG(st.st_mode)) {
-                addFile(childPath);
-                continue;
-            }
-            addProblem(childPath, QStringLiteral("不是普通文件，已跳过"));
+        if (!S_ISDIR(opened.st_mode)) {
+            addProblem(childAbsolute, QStringLiteral("无法读取目录：这不是目录"));
+            continue;
         }
+        if (visited.contains(visitKey(opened))) {
+            addProblem(childAbsolute, QStringLiteral("检测到目录循环，已跳过"));
+            continue;
+        }
+        const QString canonical = QFileInfo(childAbsolute).canonicalFilePath();
+        if (!canonicalInside(canonical, rootCanonical)) {
+            addProblem(childAbsolute, QStringLiteral("目录超出起始范围，已跳过"));
+            continue;
+        }
+
+        QString childListError;
+        QStringList childNames = listDirectoryNames(childFd.get(), &childListError);
+        if (!childListError.isEmpty()) {
+            addProblem(childAbsolute, childListError);
+            continue;
+        }
+
+        visited.insert(visitKey(opened));
+        ScanFrame child;
+        child.absolutePath = childAbsolute;
+        child.relativePath = childRelative;
+        child.fd = std::move(childFd);
+        child.names = std::move(childNames);
+        stack.push_back(std::move(child));
     }
 
     std::sort(result.files.begin(), result.files.end(),
@@ -398,10 +568,20 @@ FilterDeleteResult deleteListedFiles(const QString &rootPath, const QStringList 
     FilterDeleteResult result;
     const QString rootClean = QDir::cleanPath(rootPath.trimmed());
     const QFileInfo rootInfo(rootClean);
-    if (rootClean.isEmpty() || rootInfo.isRelative() || rootClean == QLatin1String("/")
-        || rootInfo.canonicalFilePath().isEmpty() || rootInfo.canonicalFilePath() == QLatin1String("/")
-        || !rootInfo.isDir()) {
-        result.error = QStringLiteral("目录无效，已拒绝删除");
+    if (rootClean.isEmpty() || rootInfo.isRelative() || !rootInfo.isDir()
+        || rootInfo.canonicalFilePath().isEmpty()) {
+        result.error = QStringLiteral("所选目录无效，已拒绝删除，没有改动任何文件");
+        return result;
+    }
+    if (rootClean == QLatin1String("/") || rootInfo.canonicalFilePath() == QLatin1String("/")) {
+        result.error = QStringLiteral("不能在文件系统根目录 / 上删除");
+        return result;
+    }
+
+    FileDescriptor rootFd(::open(QFile::encodeName(rootClean).constData(),
+                                 O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    if (!rootFd) {
+        result.error = QStringLiteral("无法打开所选目录，已拒绝删除：%1").arg(ioError(errno));
         return result;
     }
 
@@ -414,10 +594,10 @@ FilterDeleteResult deleteListedFiles(const QString &rootPath, const QStringList 
         }
         FilterDeleteItem item;
         item.absolutePath = QDir::cleanPath(absolutePaths.at(i));
-        item.error = unlinkInside(rootClean, item.absolutePath);
+        item.error = unlinkInside(rootFd.get(), rootClean, item.absolutePath);
         item.removed = item.error.isEmpty();
         result.items.append(item);
-        if (i == 0 || (i + 1) % 32 == 0)
+        if (i == 0 || (i + 1) % kProgressStride == 0)
             notify(progress, i + 1, total);
     }
     notify(progress, total, total);

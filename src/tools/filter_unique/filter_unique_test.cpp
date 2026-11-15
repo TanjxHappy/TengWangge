@@ -3,10 +3,12 @@
 
 #include "core/data_paths.h"
 #include "core/platform_services.h"
+#include "shell/theme.h"
 #include "shell/tool_registry.h"
 
 #include <QApplication>
 #include <QComboBox>
+#include <QVBoxLayout>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -85,11 +87,16 @@ QString openTool(Env *env)
     const QVector<ToolPage> pages = env->tool->createPages();
     if (pages.size() != 1 || !pages.at(0).widget)
         return QStringLiteral("页面创建失败");
-    pages.at(0).widget->setParent(&env->host);
+    auto *layout = new QVBoxLayout(&env->host);
+    layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    layout->addWidget(pages.at(0).widget);
     env->page = qobject_cast<FilterUniquePage *>(pages.at(0).widget);
     if (!env->page)
         return QStringLiteral("页面类型不符");
-    env->host.resize(1100, 760);
+    env->host.setStyleSheet(Theme::workbench().styleSheet());
+    // 1180x760 主窗口去掉顶栏 48、状态栏 28、页面条 40、左侧工具栏 196。
+    env->host.resize(984, 644);
     env->host.show();
     if (!QTest::qWaitForWindowExposed(&env->host))
         return QStringLiteral("窗口未能显示");
@@ -129,6 +136,10 @@ private slots:
     void deleteFailureIsListed();
     void cancelScanAndDeleteLeaveFilesUntouched();
     void sessionStaysInsideDataDir();
+    void resultsStayVisibleAtTypicalSize();
+    void staleKeywordsDisableDelete();
+    void rootDirectoryIsRefused();
+    void cancelDuringScanDropsPartialResults();
 };
 
 void FilterUniqueTests::identifierAndRuleAreStable()
@@ -265,7 +276,7 @@ void FilterUniqueTests::scanSummarizesMatchAndSkipsUnsafeLinks()
     QVERIFY(reasonContains(QStringLiteral("符号链接指向起始目录之外，已跳过")));
     QVERIFY(reasonContains(QStringLiteral("符号链接形成循环，已跳过")));
     QVERIFY(reasonContains(QStringLiteral("目录符号链接指向目录内部，未跟随")));
-    QVERIFY(reasonContains(QStringLiteral("无法读取符号链接目标")));
+    QVERIFY(reasonContains(QStringLiteral("符号链接已损坏，目标不存在")));
 
     std::atomic<bool> stop{false};
     const FilterScanResult relative = scanDirectory(QStringLiteral("relative/path"), keywords, stop, {});
@@ -348,7 +359,7 @@ void FilterUniqueTests::pageShowsSummaryFuzzyMatchAndSearch()
             && mode);
 
     keywords->setPlainText(QStringLiteral("report_2024\n\n说明\nREPORT_2024\n"));
-    QCOMPARE(keywordCount->text(), QStringLiteral("已识别 2 个关键词"));
+    QCOMPARE(keywordCount->text(), QStringLiteral("已识别 2 个关键词，已去掉 1 个重复项"));
     directory->setText(QStringLiteral("relative/not-absolute"));
     start->click();
     QVERIFY(!env.page->isBusy());
@@ -610,13 +621,178 @@ void FilterUniqueTests::sessionStaysInsideDataDir()
         const FilterScanResult result = scanDirectory(directory, {QStringLiteral("hidden")}, cancel, {});
         bool unreadable = false;
         for (const FilterProblem &problem : result.problems) {
-            if (problem.path == hidden && problem.reason.contains(QStringLiteral("无法读取目录")))
+            if (problem.path == hidden && problem.reason.contains(QStringLiteral("无法读取目录"))
+            && problem.reason.contains(QStringLiteral("没有权限")))
                 unreadable = true;
         }
         QVERIFY(unreadable);
         QFile::setPermissions(hidden,
                               QFileDevice::ReadOwner | QFileDevice::WriteOwner | QFileDevice::ExeOwner);
     }
+}
+
+void FilterUniqueTests::resultsStayVisibleAtTypicalSize()
+{
+    Env env;
+    const QString opened = openTool(&env);
+    QVERIFY2(opened.isEmpty(), qPrintable(opened));
+
+    auto *table = env.page->findChild<QTableView *>(QStringLiteral("filterUnique.results"));
+    auto *rule = env.page->findChild<QLabel *>(QStringLiteral("filterUnique.rule"));
+    QVERIFY(table);
+    QVERIFY(rule);
+    QVERIFY(table->isVisible());
+
+    const auto tableFits = [&env, table](int minimumHeight) {
+        QApplication::processEvents();
+        const QPoint origin = table->mapTo(&env.host, QPoint(0, 0));
+        if (table->height() < minimumHeight)
+            return false;
+        if (origin.y() < 0)
+            return false;
+        if (origin.y() + minimumHeight > env.host.height())
+            return false;
+        return origin.y() + table->height() <= env.host.height() + 2;
+    };
+    QVERIFY2(tableFits(180), qPrintable(QStringLiteral("table height %1, host %2")
+                                            .arg(table->height())
+                                            .arg(env.host.height())));
+    QVERIFY(rule->isVisible());
+    QVERIFY2(rule->height() <= rule->fontMetrics().lineSpacing() * 4 + 8,
+             qPrintable(QString::number(rule->height())));
+    QVERIFY(rule->height() < table->height());
+
+    auto *keywords = env.page->findChild<QPlainTextEdit *>(QStringLiteral("filterUnique.keywords"));
+    auto *directory = env.page->findChild<QLineEdit *>(QStringLiteral("filterUnique.directory"));
+    auto *start = env.page->findChild<QPushButton *>(QStringLiteral("filterUnique.start"));
+    auto *detail = env.page->findChild<QLabel *>(QStringLiteral("filterUnique.detail"));
+    QVERIFY(keywords && directory && start && detail);
+    const auto mapped = [&env](QWidget *widget) {
+        return QRect(widget->mapTo(&env.host, QPoint(0, 0)), widget->size());
+    };
+    const auto controlsSeparated = [&]() {
+        return keywords->height() >= 36 && directory->height() >= 18
+            && !mapped(keywords).intersects(mapped(directory))
+            && !mapped(start).intersects(mapped(detail));
+    };
+    QVERIFY2(controlsSeparated(), qPrintable(QStringLiteral("controls overlap at %1x%2")
+                                                 .arg(env.host.width())
+                                                 .arg(env.host.height())));
+
+    const QString root = env.temp.filePath(QStringLiteral("scan"));
+    QVERIFY(writeFile(root + QStringLiteral("/Report_2024.TXT")).isEmpty());
+    QVERIFY(writeFile(root + QStringLiteral("/keep.txt")).isEmpty());
+    env.page->findChild<QPlainTextEdit *>(QStringLiteral("filterUnique.keywords"))
+        ->setPlainText(QStringLiteral("report"));
+    env.page->findChild<QLineEdit *>(QStringLiteral("filterUnique.directory"))->setText(root);
+    env.page->findChild<QPushButton *>(QStringLiteral("filterUnique.start"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!env.page->isBusy(), 5000);
+    QCOMPARE(env.page->findChild<QLabel *>(QStringLiteral("filterUnique.matchedCount"))->text(),
+             QStringLiteral("1"));
+    QVERIFY2(tableFits(180), qPrintable(QStringLiteral("after scan table height %1").arg(table->height())));
+    QCOMPARE(table->model()->rowCount(), 2);
+
+    // 900x560 是外壳最小窗口，页面区大约 704x444。结果表仍应留在可视范围内。
+    env.host.resize(704, 444);
+    QApplication::processEvents();
+    QVERIFY2(tableFits(120), qPrintable(QStringLiteral("compact table height %1").arg(table->height())));
+    QVERIFY2(controlsSeparated(), qPrintable(QStringLiteral("controls overlap when compact")));
+}
+
+void FilterUniqueTests::staleKeywordsDisableDelete()
+{
+    Env env;
+    const QString opened = openTool(&env);
+    QVERIFY2(opened.isEmpty(), qPrintable(opened));
+    const QString root = env.temp.filePath(QStringLiteral("scan"));
+    const QString matched = root + QStringLiteral("/Report_2024.TXT");
+    QVERIFY(writeFile(matched).isEmpty());
+    QVERIFY(writeFile(root + QStringLiteral("/keep.txt")).isEmpty());
+
+    auto *keywords = env.page->findChild<QPlainTextEdit *>(QStringLiteral("filterUnique.keywords"));
+    auto *directory = env.page->findChild<QLineEdit *>(QStringLiteral("filterUnique.directory"));
+    auto *start = env.page->findChild<QPushButton *>(QStringLiteral("filterUnique.start"));
+    auto *deleteMatched = env.page->findChild<QPushButton *>(QStringLiteral("filterUnique.deleteMatched"));
+    keywords->setPlainText(QStringLiteral("report_2024"));
+    directory->setText(root);
+    start->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!env.page->isBusy(), 5000);
+    QVERIFY(deleteMatched->isEnabled());
+
+    keywords->setPlainText(QStringLiteral("report_2024\nextra"));
+    QVERIFY(!deleteMatched->isEnabled());
+    QVERIFY(env.page->findChild<QLabel *>(QStringLiteral("filterUnique.detail"))
+                ->text()
+                .contains(QStringLiteral("请重新筛选")));
+    deleteMatched->click();
+    QVERIFY(env.page->findChild<QWidget *>(QStringLiteral("filterUnique.preview"))->isHidden());
+    QVERIFY(QFileInfo::exists(matched));
+
+    keywords->setPlainText(QStringLiteral("report_2024"));
+    QVERIFY(deleteMatched->isEnabled());
+    QVERIFY(QFileInfo::exists(matched));
+    QVERIFY(QFileInfo(root).isDir());
+}
+
+void FilterUniqueTests::rootDirectoryIsRefused()
+{
+    std::atomic<bool> cancel{false};
+    const FilterScanResult scanned = scanDirectory(QStringLiteral("/"), {QStringLiteral("etc")}, cancel, {});
+    QVERIFY(scanned.files.isEmpty());
+    QVERIFY(scanned.error.contains(QStringLiteral("根目录")));
+
+    QTemporaryDir outside;
+    QVERIFY(outside.isValid());
+    const QString linkPath = outside.filePath(QStringLiteral("root-link"));
+    RemovePath linkGuard{linkPath};
+    QVERIFY(QFile::link(QStringLiteral("/"), linkPath));
+    const FilterScanResult viaLink = scanDirectory(linkPath, {QStringLiteral("etc")}, cancel, {});
+    QVERIFY(viaLink.files.isEmpty());
+    QVERIFY(viaLink.error.contains(QStringLiteral("根目录")));
+
+    const FilterDeleteResult deleted = deleteListedFiles(
+        QStringLiteral("/"), {QStringLiteral("/etc/passwd")}, cancel, {});
+    QVERIFY(deleted.items.isEmpty());
+    QVERIFY(deleted.error.contains(QStringLiteral("根目录")));
+    if (QFileInfo::exists(QStringLiteral("/etc/passwd")))
+        QVERIFY(QFileInfo::exists(QStringLiteral("/etc/passwd")));
+
+    Env env;
+    const QString opened = openTool(&env);
+    QVERIFY2(opened.isEmpty(), qPrintable(opened));
+    env.page->findChild<QPlainTextEdit *>(QStringLiteral("filterUnique.keywords"))
+        ->setPlainText(QStringLiteral("etc"));
+    env.page->findChild<QLineEdit *>(QStringLiteral("filterUnique.directory"))->setText(QStringLiteral("/"));
+    env.page->findChild<QPushButton *>(QStringLiteral("filterUnique.start"))->click();
+    QVERIFY(!env.page->isBusy());
+    QVERIFY(!env.platform->gate()->isLocked());
+    QCOMPARE(env.platform->status()->current(QStringLiteral("filter-unique")).state, StatusState::Error);
+    QVERIFY(env.page->findChild<QLabel *>(QStringLiteral("filterUnique.detail"))
+                ->text()
+                .contains(QStringLiteral("根目录")));
+}
+
+void FilterUniqueTests::cancelDuringScanDropsPartialResults()
+{
+    QTemporaryDir root;
+    QVERIFY(root.isValid());
+    for (int i = 0; i < 80; ++i)
+        QVERIFY(writeFile(root.filePath(QStringLiteral("f%1.txt").arg(i))).isEmpty());
+
+    std::atomic<bool> cancel{false};
+    int callbacks = 0;
+    const FilterScanResult result = scanDirectory(
+        root.path(), {QStringLiteral("f")}, cancel, [&](int files, int) {
+            ++callbacks;
+            if (files >= 1)
+                cancel.store(true);
+        });
+    QVERIFY(callbacks >= 1);
+    QVERIFY(result.cancelled);
+    QVERIFY(result.files.isEmpty());
+    QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("f0.txt"))));
+    QVERIFY(QFileInfo::exists(root.filePath(QStringLiteral("f79.txt"))));
+    QVERIFY(QFileInfo(root.path()).isDir());
 }
 
 QTEST_MAIN(FilterUniqueTests)

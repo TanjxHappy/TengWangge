@@ -15,8 +15,10 @@ class QListWidget;
 class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
+class QShowEvent;
 class QTableView;
 class QThread;
+class QTimer;
 
 namespace tw {
 
@@ -42,8 +44,8 @@ public:
     void setStepDelayMs(int milliseconds) { m_stepDelayMs = qMax(0, milliseconds); }
     bool importKeywordsFromFile(const QString &path, QString *error);
 
-private slots:
-    void setBusyDetail(const QString &text);
+protected:
+    void showEvent(QShowEvent *event) override;
 
 private:
     enum class PreviewStage { Hidden, Review, Confirm };
@@ -52,6 +54,10 @@ private:
     void loadSession();
     void saveSession() const;
     void refreshKeywordCount();
+    void setDetail(const QString &text);
+    void pollProgress();
+    void syncProblemPane();
+    QString summaryLine() const;
     void startScan();
     void cancelTask();
     void browseDirectory();
@@ -77,14 +83,17 @@ private:
     ToolServices m_services;
     QString m_dataDir;
     QString m_scannedRoot;
+    QString m_scannedKeywordText;
     QPointer<QWidget> m_dialogParent;
     NavigationLock m_lock;
     std::shared_ptr<FilterJob> m_job;
     QThread *m_thread = nullptr;
+    QTimer *m_progressTimer = nullptr;
     int m_stepDelayMs = 0;
     bool m_busy = false;
     bool m_aborting = false;
     bool m_loading = false;
+    bool m_resultsStale = false;
     PreviewStage m_previewStage = PreviewStage::Hidden;
     bool m_previewMatched = true;
     QStringList m_pendingPaths;
@@ -104,6 +113,8 @@ private:
     QProgressBar *m_progress = nullptr;
     QLabel *m_detail = nullptr;
     QLabel *m_rule = nullptr;
+    QWidget *m_top = nullptr;
+    QWidget *m_problemBox = nullptr;
     QLabel *m_matchedLabel = nullptr;
     QLabel *m_unmatchedLabel = nullptr;
     QLabel *m_totalLabel = nullptr;

@@ -23,12 +23,16 @@
 #include <QSaveFile>
 #include <QScrollArea>
 #include <QSet>
+#include <QShowEvent>
+#include <QSizePolicy>
 #include <QSortFilterProxyModel>
 #include <QSplitter>
 #include <QTableView>
 #include <QThread>
+#include <QTimer>
 #include <QVBoxLayout>
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 #include <utility>
@@ -38,13 +42,25 @@ namespace {
 
 QString matchRuleText()
 {
+    // 固定三行，避免自动换行把结果表挤出窗口。
     return QStringLiteral(
-        "匹配规则：每行一个名称或关键词，忽略空行，重复的关键词只保留第一次出现的写法。"
-        "递归扫描所选目录中的文件，把相对路径和文件名与关键词做子串比较，不区分大小写；"
-        "命中任意一个关键词即算匹配。不比较所选目录本身的绝对路径，也不读取文件内容。"
-        "符号链接不会跟到起始目录之外，循环链接会跳过；目录符号链接不展开，避免把同一批文件算两遍。"
-        "无法读取的项只记入问题列表，不会被删除。"
-        "只有完成预览和第二次确认后才会删除文件；未确认不会改动该目录，也不会删除目录本身。");
+        "匹配规则：每行一个关键词，空行忽略；重复项不区分大小写，只保留第一次。\n"
+        "相对路径和文件名按子串匹配，不读文件内容。符号链接不越界、不循环。\n"
+        "删除须先预览完整列表，再做第二次确认；未确认不改目录，也不删除目录本身。");
+}
+
+int nonEmptyLineCount(const QString &text)
+{
+    QString normalized = text;
+    normalized.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
+    normalized.replace(QLatin1Char('\r'), QLatin1Char('\n'));
+    int count = 0;
+    const QStringList lines = normalized.split(QLatin1Char('\n'));
+    for (const QString &line : lines) {
+        if (!line.trimmed().isEmpty())
+            ++count;
+    }
+    return count;
 }
 
 QLabel *makeLabel(const QString &text, const char *role)
@@ -257,6 +273,8 @@ struct FilterJob
 
     Kind kind = Kind::Scan;
     std::atomic<bool> cancel{false};
+    std::atomic<int> seenFiles{0};
+    std::atomic<int> seenProblems{0};
     int stepDelayMs = 0;
     QString root;
     QStringList keywords;
@@ -318,10 +336,23 @@ FilterUniquePage::~FilterUniquePage()
     abort();
 }
 
+void FilterUniquePage::showEvent(QShowEvent *event)
+{
+    QWidget::showEvent(event);
+    if (!m_top || !m_top->layout())
+        return;
+    // 样式生效后再锁定上半区的自然高度，窄窗口改为滚动，而不是把输入框压叠在一起。
+    const int natural = m_top->layout()->totalSizeHint().height();
+    if (natural > 0 && m_top->minimumHeight() != natural)
+        m_top->setMinimumHeight(natural);
+}
+
 void FilterUniquePage::abort()
 {
     saveSession();
     m_aborting = true;
+    if (m_progressTimer)
+        m_progressTimer->stop();
     if (m_job)
         m_job->cancel.store(true);
     if (m_thread && m_thread->isRunning())
@@ -373,48 +404,59 @@ void FilterUniquePage::buildUi()
     setAccessibleName(QStringLiteral("筛选去重"));
     setObjectName(QStringLiteral("filterUnique.page"));
 
-    auto *scroll = new QScrollArea(this);
-    scroll->setObjectName(QStringLiteral("filterUnique.scroll"));
-    scroll->setWidgetResizable(true);
-    scroll->setFrameShape(QFrame::NoFrame);
-    scroll->setAccessibleName(QStringLiteral("筛选去重内容"));
-    scroll->viewport()->setAutoFillBackground(false);
+    auto *layout = new QVBoxLayout(this);
+    layout->setContentsMargins(16, 10, 16, 10);
+    layout->setSpacing(6);
 
-    auto *content = new QWidget;
-    auto *layout = new QVBoxLayout(content);
-    layout->setContentsMargins(28, 24, 28, 24);
-    layout->setSpacing(12);
-    scroll->setWidget(content);
+    m_top = new QWidget;
+    auto *topLayout = new QVBoxLayout(m_top);
+    topLayout->setContentsMargins(0, 0, 0, 0);
+    topLayout->setSpacing(6);
 
-    auto *outer = new QVBoxLayout(this);
-    outer->setContentsMargins(0, 0, 0, 0);
-    outer->addWidget(scroll);
+    auto *title = makeLabel(QStringLiteral("筛选去重"), "pageTitle");
+    title->setWordWrap(false);
+    auto *subtitle = makeLabel(QStringLiteral("按名单筛选目录中的文件。删除前会先预览，再确认一次。"),
+                               "pageSubtitle");
+    subtitle->setWordWrap(false);
+    auto *heading = new QHBoxLayout;
+    heading->setContentsMargins(0, 0, 0, 0);
+    heading->setSpacing(12);
+    heading->addWidget(title);
+    heading->addWidget(subtitle, 1);
+    topLayout->addLayout(heading);
 
-    layout->addWidget(makeLabel(QStringLiteral("筛选去重"), "pageTitle"));
-    layout->addWidget(makeLabel(
-        QStringLiteral("按名单模糊筛选目录中的文件。删除前会预览列表并二次确认。"), "pageSubtitle"));
     m_rule = makeLabel(matchRuleText(), "hint");
     m_rule->setObjectName(QStringLiteral("filterUnique.rule"));
+    m_rule->setWordWrap(false);
     m_rule->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_rule->setToolTip(m_rule->text());
 
     auto *form = new QFrame;
     form->setProperty("role", QStringLiteral("card"));
     auto *grid = new QGridLayout(form);
-    grid->setContentsMargins(16, 14, 16, 14);
-    grid->setHorizontalSpacing(12);
-    grid->setVerticalSpacing(8);
+    grid->setContentsMargins(12, 8, 12, 8);
+    grid->setHorizontalSpacing(8);
+    grid->setVerticalSpacing(6);
     grid->setColumnStretch(0, 1);
 
-    grid->addWidget(makeLabel(QStringLiteral("筛选名单"), "fieldLabel"), 0, 0);
+    m_keywordCount = makeLabel(QStringLiteral("已识别 0 个关键词"), "hint");
+    m_keywordCount->setObjectName(QStringLiteral("filterUnique.keywordCount"));
+    m_keywordCount->setWordWrap(false);
+    auto *keywordHeader = new QHBoxLayout;
+    keywordHeader->setContentsMargins(0, 0, 0, 0);
+    keywordHeader->setSpacing(8);
+    keywordHeader->addWidget(makeLabel(QStringLiteral("筛选名单"), "fieldLabel"));
+    keywordHeader->addStretch(1);
+    keywordHeader->addWidget(m_keywordCount);
+    grid->addLayout(keywordHeader, 0, 0, 1, 2);
 
     m_keywords = new QPlainTextEdit;
     m_keywords->setObjectName(QStringLiteral("filterUnique.keywords"));
     m_keywords->setPlaceholderText(QStringLiteral("每行一个名称或关键词，可直接粘贴"));
-    m_keywords->setMinimumHeight(64);
-    m_keywords->setMaximumHeight(96);
+    m_keywords->setFixedHeight(48);
     m_keywords->setAccessibleName(QStringLiteral("筛选名单，每行一个名称或关键词"));
     m_keywords->setTabChangesFocus(true);
-    m_keywords->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_keywords->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
     m_import = new QPushButton(QStringLiteral("导入文本…"));
     m_import->setObjectName(QStringLiteral("filterUnique.import"));
@@ -424,17 +466,12 @@ void FilterUniquePage::buildUi()
     grid->addWidget(m_keywords, 1, 0);
     grid->addWidget(m_import, 1, 1, Qt::AlignTop);
 
-    m_keywordCount = makeLabel(QStringLiteral("已识别 0 个关键词"), "hint");
-    m_keywordCount->setObjectName(QStringLiteral("filterUnique.keywordCount"));
-    grid->addWidget(m_keywordCount, 2, 0, 1, 2);
-
-    grid->addWidget(makeLabel(QStringLiteral("目录"), "fieldLabel"), 3, 0);
-
     m_directory = new QLineEdit;
     m_directory->setObjectName(QStringLiteral("filterUnique.directory"));
-    m_directory->setPlaceholderText(QStringLiteral("/data/project"));
+    m_directory->setPlaceholderText(QStringLiteral("已存在的完整路径，例如 /data/project"));
     m_directory->setAccessibleName(QStringLiteral("要筛选的目录，必须是已存在的绝对路径"));
     m_directory->setClearButtonEnabled(true);
+    m_directory->setToolTip(QStringLiteral("填写已经存在的目录，并从 / 开始写完整路径。不能选择根目录 /。筛选本身不会修改这个目录。"));
 
     m_browse = new QPushButton(QStringLiteral("浏览…"));
     m_browse->setObjectName(QStringLiteral("filterUnique.browse"));
@@ -444,13 +481,10 @@ void FilterUniquePage::buildUi()
     auto *dirLayout = new QHBoxLayout(dirRow);
     dirLayout->setContentsMargins(0, 0, 0, 0);
     dirLayout->setSpacing(8);
+    dirLayout->addWidget(makeLabel(QStringLiteral("目录"), "fieldLabel"));
     dirLayout->addWidget(m_directory, 1);
     dirLayout->addWidget(m_browse);
-    grid->addWidget(dirRow, 4, 0, 1, 2);
-
-    grid->addWidget(makeLabel(
-                         QStringLiteral("必须是已存在的绝对路径。扫描本身不会修改该目录。"), "hint"),
-                     5, 0, 1, 2);
+    grid->addWidget(dirRow, 2, 0, 1, 2);
 
     m_start = new QPushButton(QStringLiteral("开始筛选"));
     m_start->setObjectName(QStringLiteral("filterUnique.start"));
@@ -472,9 +506,6 @@ void FilterUniquePage::buildUi()
     m_progress->setFocusPolicy(Qt::NoFocus);
     m_progress->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
 
-    m_detail = makeLabel(QStringLiteral("尚未筛选"), "hint");
-    m_detail->setObjectName(QStringLiteral("filterUnique.detail"));
-
     auto *actions = new QWidget;
     auto *actionLayout = new QHBoxLayout(actions);
     actionLayout->setContentsMargins(0, 0, 0, 0);
@@ -482,10 +513,28 @@ void FilterUniquePage::buildUi()
     actionLayout->addWidget(m_start);
     actionLayout->addWidget(m_cancel);
     actionLayout->addWidget(m_progress, 1);
-    actionLayout->addWidget(m_detail, 1);
-    grid->addWidget(actions, 6, 0, 1, 2);
-    layout->addWidget(form);
-    layout->addWidget(m_rule);
+    grid->addWidget(actions, 3, 0, 1, 2);
+
+    m_detail = makeLabel(QStringLiteral("还没有筛选。填写名单和目录后，点击「开始筛选」。"), "hint");
+    m_detail->setObjectName(QStringLiteral("filterUnique.detail"));
+    m_detail->setToolTip(m_detail->text());
+    m_detail->setMaximumHeight(m_detail->fontMetrics().lineSpacing() * 2 + 4);
+    grid->addWidget(m_detail, 4, 0, 1, 2);
+    topLayout->addWidget(form);
+    topLayout->addWidget(m_rule);
+    m_top->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
+    m_top->setMinimumHeight(m_top->sizeHint().height());
+
+    auto *topScroll = new QScrollArea;
+    topScroll->setObjectName(QStringLiteral("filterUnique.topScroll"));
+    topScroll->setWidgetResizable(true);
+    topScroll->setFrameShape(QFrame::NoFrame);
+    topScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    topScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    topScroll->setWidget(m_top);
+    topScroll->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    topScroll->viewport()->setAutoFillBackground(false);
+    layout->addWidget(topScroll);
 
     auto *summary = new QHBoxLayout;
     summary->setSpacing(16);
@@ -507,29 +556,27 @@ void FilterUniquePage::buildUi()
     addCount(&m_problemLabel, QStringLiteral("filterUnique.problemCount"), QStringLiteral("问题"),
              QStringLiteral("问题数"));
     summary->addStretch(1);
-    layout->addLayout(summary);
 
     m_deleteMatched = new QPushButton(QStringLiteral("删除匹配的文件（0）"));
     m_deleteMatched->setObjectName(QStringLiteral("filterUnique.deleteMatched"));
     m_deleteMatched->setProperty("role", QStringLiteral("danger"));
     m_deleteMatched->setAccessibleName(QStringLiteral("删除匹配的文件"));
     m_deleteMatched->setAutoDefault(false);
+    m_deleteMatched->setToolTip(QStringLiteral("删除全部匹配的文件，不受当前搜索影响。下一步只预览，不会立刻删除。"));
 
     m_deleteUnmatched = new QPushButton(QStringLiteral("删除不匹配的文件（0）"));
     m_deleteUnmatched->setObjectName(QStringLiteral("filterUnique.deleteUnmatched"));
     m_deleteUnmatched->setProperty("role", QStringLiteral("danger"));
     m_deleteUnmatched->setAccessibleName(QStringLiteral("删除不匹配的文件"));
     m_deleteUnmatched->setAutoDefault(false);
+    m_deleteUnmatched->setToolTip(QStringLiteral("删除全部不匹配的文件，不受当前搜索影响。下一步只预览，不会立刻删除。"));
 
-    auto *deleteRow = new QHBoxLayout;
-    deleteRow->setSpacing(8);
-    deleteRow->addWidget(m_deleteMatched);
-    deleteRow->addWidget(m_deleteUnmatched);
-    deleteRow->addStretch(1);
-    layout->addLayout(deleteRow);
-    layout->addWidget(makeLabel(
-        QStringLiteral("删除作用于全部匹配或不匹配的文件，不受搜索过滤影响。默认不会删除，需先预览再第二次确认。"),
-        "hint"));
+    summary->addWidget(m_deleteMatched);
+    summary->addWidget(m_deleteUnmatched);
+    layout->addLayout(summary);
+    auto *deleteHint = makeLabel(QStringLiteral("删除范围不受上面的搜索影响，确认前不会改动目录。"), "hint");
+    deleteHint->setWordWrap(false);
+    layout->addWidget(deleteHint);
 
     m_search = new QLineEdit;
     m_search->setObjectName(QStringLiteral("filterUnique.search"));
@@ -593,7 +640,7 @@ void FilterUniquePage::buildUi()
     m_problems->setAlternatingRowColors(true);
     m_problems->setWordWrap(false);
     m_problems->setTextElideMode(Qt::ElideMiddle);
-    m_problems->setMinimumHeight(80);
+    m_problems->setMinimumHeight(72);
     m_problems->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
 
     auto *resultBox = new QWidget;
@@ -603,19 +650,22 @@ void FilterUniquePage::buildUi()
     resultLayout->addWidget(makeLabel(QStringLiteral("筛选结果"), "sectionTitle"));
     resultLayout->addWidget(m_results, 1);
 
-    auto *problemBox = new QWidget;
-    auto *problemLayout = new QVBoxLayout(problemBox);
+    m_problemBox = new QWidget;
+    auto *problemLayout = new QVBoxLayout(m_problemBox);
     problemLayout->setContentsMargins(0, 0, 0, 0);
     problemLayout->setSpacing(6);
     problemLayout->addWidget(makeLabel(QStringLiteral("问题"), "sectionTitle"));
     problemLayout->addWidget(m_problems, 1);
 
     auto *splitter = new QSplitter(Qt::Vertical);
+    splitter->setObjectName(QStringLiteral("filterUnique.splitter"));
     splitter->setChildrenCollapsible(false);
     splitter->addWidget(resultBox);
-    splitter->addWidget(problemBox);
-    splitter->setStretchFactor(0, 3);
+    splitter->addWidget(m_problemBox);
+    splitter->setStretchFactor(0, 4);
     splitter->setStretchFactor(1, 1);
+    splitter->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    m_problemBox->hide();
     layout->addWidget(splitter, 1);
 
     m_preview = new QFrame;
@@ -631,8 +681,8 @@ void FilterUniquePage::buildUi()
     m_previewList = new QListWidget;
     m_previewList->setObjectName(QStringLiteral("filterUnique.previewList"));
     m_previewList->setAccessibleName(QStringLiteral("即将删除的文件"));
-    m_previewList->setMinimumHeight(80);
-    m_previewList->setMaximumHeight(200);
+    m_previewList->setMinimumHeight(64);
+    m_previewList->setMaximumHeight(120);
     m_previewList->setUniformItemSizes(true);
     m_previewList->setTextElideMode(Qt::ElideMiddle);
     m_previewCancel = new QPushButton(QStringLiteral("取消"));
@@ -663,7 +713,12 @@ void FilterUniquePage::buildUi()
     previewLayout->addWidget(m_previewHint);
     previewLayout->addWidget(m_previewList);
     previewLayout->addLayout(previewButtons);
+    m_preview->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
     layout->addWidget(m_preview);
+
+    m_progressTimer = new QTimer(this);
+    m_progressTimer->setInterval(150);
+    connect(m_progressTimer, &QTimer::timeout, this, [this]() { pollProgress(); });
 
     connect(m_keywords, &QPlainTextEdit::textChanged, this, &FilterUniquePage::refreshKeywordCount);
     connect(m_import, &QPushButton::clicked, this, &FilterUniquePage::importFromDialog);
@@ -752,8 +807,82 @@ void FilterUniquePage::refreshKeywordCount()
 {
     if (!m_keywords || !m_keywordCount)
         return;
-    const int count = parseKeywords(m_keywords->toPlainText()).size();
-    m_keywordCount->setText(QStringLiteral("已识别 %1 个关键词").arg(count));
+    const QString text = m_keywords->toPlainText();
+    const int count = parseKeywords(text).size();
+    const int lines = nonEmptyLineCount(text);
+    if (lines > count) {
+        m_keywordCount->setText(QStringLiteral("已识别 %1 个关键词，已去掉 %2 个重复项")
+                                    .arg(count)
+                                    .arg(lines - count));
+    } else {
+        m_keywordCount->setText(QStringLiteral("已识别 %1 个关键词").arg(count));
+    }
+
+    if (m_loading || m_scannedRoot.isEmpty())
+        return;
+    const bool stale = text != m_scannedKeywordText;
+    if (stale == m_resultsStale)
+        return;
+    m_resultsStale = stale;
+    if (stale) {
+        if (m_previewStage != PreviewStage::Hidden && !m_busy) {
+            m_previewStage = PreviewStage::Hidden;
+            m_pendingPaths.clear();
+            if (m_previewList)
+                m_previewList->clear();
+            m_services.showStatus(StatusState::Info,
+                                  QStringLiteral("名单已修改，已关闭删除确认，尚未删除任何文件"));
+        }
+        if (!m_busy)
+            setDetail(QStringLiteral("名单已修改，当前结果只供查看。请重新筛选后再删除。"));
+    } else if (!m_busy) {
+        setDetail(summaryLine());
+    }
+    updateUi();
+}
+
+void FilterUniquePage::setDetail(const QString &text)
+{
+    if (!m_detail)
+        return;
+    m_detail->setText(text);
+    m_detail->setToolTip(text);
+}
+
+void FilterUniquePage::pollProgress()
+{
+    if (m_aborting || !m_busy || !m_job || m_job->cancel.load())
+        return;
+    const int done = m_job->seenFiles.load(std::memory_order_relaxed);
+    const int extra = m_job->seenProblems.load(std::memory_order_relaxed);
+    if (m_job->kind == FilterJob::Kind::Scan) {
+        setDetail(QStringLiteral("正在筛选：已看到 %1 个文件，问题 %2 项").arg(done).arg(extra));
+        return;
+    }
+    setDetail(QStringLiteral("正在删除：已处理 %1 / %2 个文件").arg(done).arg(extra));
+    if (extra > 0 && m_progress) {
+        m_progress->setRange(0, extra);
+        m_progress->setValue(qBound(0, done, extra));
+    }
+}
+
+void FilterUniquePage::syncProblemPane()
+{
+    if (!m_problemBox || !m_problemModel)
+        return;
+    m_problemBox->setVisible(!m_problemModel->problems().isEmpty());
+}
+
+QString FilterUniquePage::summaryLine() const
+{
+    QString summary = QStringLiteral("筛选完成：匹配 %1 个，不匹配 %2 个，一共 %3 个文件")
+                          .arg(m_matched)
+                          .arg(m_unmatched)
+                          .arg(m_total);
+    if (m_problemCount > 0) {
+        summary += QStringLiteral("。另有 %1 项没能读取，已写在下方问题列表里").arg(m_problemCount);
+    }
+    return summary;
 }
 
 void FilterUniquePage::startScan()
@@ -765,30 +894,29 @@ void FilterUniquePage::startScan()
     auto reject = [this](const QString &message) {
         m_services.logError(message);
         m_services.showStatus(StatusState::Error, message);
-        if (m_detail)
-            m_detail->setText(message);
+        setDetail(message);
     };
 
     const QStringList keywords = parseKeywords(m_keywords->toPlainText());
     refreshKeywordCount();
     if (keywords.isEmpty()) {
-        reject(QStringLiteral("请填写筛选名单，每行一个名称或关键词"));
+        reject(QStringLiteral("请先填写筛选名单，每行一个名称或关键词"));
         return;
     }
 
     const QString typed = m_directory->text().trimmed();
     if (typed.isEmpty()) {
-        reject(QStringLiteral("请填写要筛选的目录"));
+        reject(QStringLiteral("请先填写要筛选的目录"));
         return;
     }
     const QString clean = QDir::cleanPath(typed);
     const QFileInfo info(clean);
     if (info.isRelative()) {
-        reject(QStringLiteral("目录必须是绝对路径"));
+        reject(QStringLiteral("目录必须从 / 开始写完整路径"));
         return;
     }
     if (clean == QLatin1String("/") || info.canonicalFilePath() == QLatin1String("/")) {
-        reject(QStringLiteral("不能选择文件系统根目录"));
+        reject(QStringLiteral("不能选择文件系统根目录 /"));
         return;
     }
     if (!info.exists()) {
@@ -796,7 +924,7 @@ void FilterUniquePage::startScan()
         return;
     }
     if (!info.isDir()) {
-        reject(QStringLiteral("路径不是目录：%1").arg(clean));
+        reject(QStringLiteral("这不是目录：%1").arg(clean));
         return;
     }
     if (info.canonicalFilePath().isEmpty()) {
@@ -810,13 +938,12 @@ void FilterUniquePage::startScan()
     job->root = clean;
     job->keywords = keywords;
     job->stepDelayMs = m_stepDelayMs;
-    FilterUniquePage *page = this;
-    job->progress = [page](int files, int problems) {
-        const QString text = QStringLiteral("已扫描 %1 个文件，问题 %2 个").arg(files).arg(problems);
-        QMetaObject::invokeMethod(page, "setBusyDetail", Qt::QueuedConnection, Q_ARG(QString, text));
+    std::atomic<int> *files = &job->seenFiles;
+    std::atomic<int> *problems = &job->seenProblems;
+    job->progress = [files, problems](int fileCount, int problemCount) {
+        files->store(fileCount, std::memory_order_relaxed);
+        problems->store(problemCount, std::memory_order_relaxed);
     };
-    m_progress->setRange(0, 0);
-    m_detail->setText(QStringLiteral("正在筛选…"));
     startJob(job, QStringLiteral("正在筛选文件"),
              QStringLiteral("正在筛选文件（关键词 %1 个）").arg(keywords.size()));
 }
@@ -827,7 +954,7 @@ void FilterUniquePage::cancelTask()
         return;
     m_job->cancel.store(true);
     m_cancel->setEnabled(false);
-    m_detail->setText(QStringLiteral("正在取消…"));
+    setDetail(QStringLiteral("正在取消，请稍候…"));
     m_services.showStatus(StatusState::Busy, QStringLiteral("正在取消…"));
     m_services.logWarning(QStringLiteral("正在取消"));
 }
@@ -896,6 +1023,7 @@ void FilterUniquePage::recount()
     if (m_problemLabel)
         m_problemLabel->setText(QString::number(m_problemCount));
     updateVisibleCount();
+    syncProblemPane();
 }
 
 void FilterUniquePage::updateUi()
@@ -907,12 +1035,12 @@ void FilterUniquePage::updateUi()
     if (m_cancel)
         m_cancel->setEnabled(busy);
     if (m_deleteMatched) {
-        m_deleteMatched->setEnabled(!busy && !previewOpen && m_matched > 0);
+        m_deleteMatched->setEnabled(!busy && !previewOpen && !m_resultsStale && m_matched > 0);
         m_deleteMatched->setText(QStringLiteral("删除匹配的文件（%1）").arg(m_matched));
         m_deleteMatched->setAccessibleName(m_deleteMatched->text());
     }
     if (m_deleteUnmatched) {
-        m_deleteUnmatched->setEnabled(!busy && !previewOpen && m_unmatched > 0);
+        m_deleteUnmatched->setEnabled(!busy && !previewOpen && !m_resultsStale && m_unmatched > 0);
         m_deleteUnmatched->setText(QStringLiteral("删除不匹配的文件（%1）").arg(m_unmatched));
         m_deleteUnmatched->setAccessibleName(m_deleteUnmatched->text());
     }
@@ -1004,14 +1132,14 @@ void FilterUniquePage::confirmDelete()
     job->root = root;
     job->paths = paths;
     job->stepDelayMs = m_stepDelayMs;
-    FilterUniquePage *page = this;
-    job->progress = [page](int done, int total) {
-        const QString text = QStringLiteral("已处理 %1 / %2").arg(done).arg(total);
-        QMetaObject::invokeMethod(page, "setBusyDetail", Qt::QueuedConnection, Q_ARG(QString, text));
+    job->seenProblems.store(paths.size());
+    std::atomic<int> *done = &job->seenFiles;
+    std::atomic<int> *total = &job->seenProblems;
+    job->progress = [done, total](int finished, int all) {
+        done->store(finished, std::memory_order_relaxed);
+        total->store(all, std::memory_order_relaxed);
     };
-    m_progress->setRange(0, 0);
-    m_detail->setText(QStringLiteral("正在删除…"));
-    startJob(job, QStringLiteral("正在删除文件"), QStringLiteral("正在删除文件"));
+    startJob(job, QStringLiteral("正在删除文件"), QStringLiteral("正在删除已确认的文件"));
 }
 
 void FilterUniquePage::startJob(const std::shared_ptr<FilterJob> &job, const QString &lockReason,
@@ -1024,14 +1152,28 @@ void FilterUniquePage::startJob(const std::shared_ptr<FilterJob> &job, const QSt
     m_lock = m_services.lockNavigation(lockReason);
     m_services.showStatus(StatusState::Busy, statusText);
     m_services.logInfo(statusText);
+    if (job->kind == FilterJob::Kind::Delete) {
+        const int total = job->paths.size();
+        m_progress->setRange(0, qMax(1, total));
+        m_progress->setValue(0);
+        setDetail(QStringLiteral("正在删除：已处理 0 / %1 个文件").arg(total));
+    } else {
+        m_progress->setRange(0, 0);
+        m_progress->setValue(0);
+        setDetail(QStringLiteral("正在筛选：已看到 0 个文件，问题 0 项"));
+    }
     m_thread = new FilterUniqueThread(job);
     connect(m_thread, &QThread::finished, this, &FilterUniquePage::onThreadFinished, Qt::QueuedConnection);
     updateUi();
+    if (m_progressTimer)
+        m_progressTimer->start();
     m_thread->start();
 }
 
 void FilterUniquePage::onThreadFinished()
 {
+    if (m_progressTimer)
+        m_progressTimer->stop();
     const bool aborting = m_aborting;
     std::shared_ptr<FilterJob> job = std::move(m_job);
     if (m_thread) {
@@ -1057,7 +1199,7 @@ void FilterUniquePage::applyScan(const FilterScanResult &result)
         clearResults();
         m_progress->setRange(0, 100);
         m_progress->setValue(0);
-        m_detail->setText(QStringLiteral("已取消"));
+        setDetail(QStringLiteral("已取消筛选，未改动目录"));
         m_services.logWarning(QStringLiteral("筛选已取消，未改动目录"));
         m_services.showStatus(StatusState::Info, QStringLiteral("已取消筛选，未改动目录"));
         return;
@@ -1066,7 +1208,7 @@ void FilterUniquePage::applyScan(const FilterScanResult &result)
         clearResults();
         m_progress->setRange(0, 100);
         m_progress->setValue(0);
-        m_detail->setText(result.error);
+        setDetail(result.error);
         m_services.logError(result.error);
         m_services.showStatus(StatusState::Error, result.error);
         return;
@@ -1075,17 +1217,16 @@ void FilterUniquePage::applyScan(const FilterScanResult &result)
     m_fileModel->setRows(result.files);
     m_problemModel->setProblems(result.problems);
     m_scannedRoot = result.rootPath;
+    m_scannedKeywordText = m_keywords ? m_keywords->toPlainText() : QString();
+    m_resultsStale = false;
     recount();
     m_progress->setRange(0, 100);
     m_progress->setValue(100);
-    const QString summary = QStringLiteral("筛选完成：匹配 %1，不匹配 %2，共 %3")
-                                .arg(m_matched)
-                                .arg(m_unmatched)
-                                .arg(m_total);
-    m_detail->setText(summary);
+    const QString summary = summaryLine();
+    setDetail(summary);
     m_services.logSuccess(summary);
     if (!result.problems.isEmpty()) {
-        m_services.logWarning(QStringLiteral("有 %1 项无法读取或已跳过").arg(result.problems.size()));
+        m_services.logWarning(QStringLiteral("有 %1 项没能读取或已跳过，详见问题列表").arg(result.problems.size()));
         const int limit = qMin(result.problems.size(), 5);
         for (int i = 0; i < limit; ++i) {
             m_services.logWarning(QStringLiteral("%1：%2")
@@ -1125,21 +1266,23 @@ void FilterUniquePage::applyDelete(const FilterDeleteResult &result)
     m_progress->setValue(result.cancelled ? 0 : 100);
 
     if (!result.error.isEmpty()) {
-        m_detail->setText(result.error);
+        setDetail(result.error);
         m_services.logError(result.error);
         m_services.showStatus(StatusState::Error, result.error);
         return;
     }
     if (result.cancelled) {
-        const QString text = QStringLiteral("已取消删除：已删除 %1 个，其余未改动").arg(removed);
-        m_detail->setText(text);
+        const QString text = QStringLiteral("已取消删除：已经删掉 %1 个，其余文件没有改动").arg(removed);
+        setDetail(text);
         m_services.logWarning(text);
         m_services.showStatus(StatusState::Info, text);
         return;
     }
     if (!failures.isEmpty()) {
-        const QString text = QStringLiteral("已删除 %1 个，失败 %2 个").arg(removed).arg(failures.size());
-        m_detail->setText(text);
+        const QString text = QStringLiteral("删除没有全部完成：成功 %1 个，失败 %2 个。失败原因在问题列表里")
+                                 .arg(removed)
+                                 .arg(failures.size());
+        setDetail(text);
         m_services.logError(text);
         const int limit = qMin(failures.size(), 5);
         for (int i = 0; i < limit; ++i)
@@ -1147,8 +1290,8 @@ void FilterUniquePage::applyDelete(const FilterDeleteResult &result)
         m_services.showStatus(StatusState::Error, text);
         return;
     }
-    const QString text = QStringLiteral("已删除 %1 个文件").arg(removed);
-    m_detail->setText(text);
+    const QString text = QStringLiteral("已删除 %1 个文件，目录本身仍保留").arg(removed);
+    setDetail(text);
     m_services.logSuccess(text);
     m_services.showStatus(StatusState::Success, text);
 }
@@ -1160,6 +1303,8 @@ void FilterUniquePage::clearResults()
     if (m_problemModel)
         m_problemModel->setProblems({});
     m_scannedRoot.clear();
+    m_scannedKeywordText.clear();
+    m_resultsStale = false;
     m_pendingPaths.clear();
     if (m_previewList)
         m_previewList->clear();
@@ -1177,12 +1322,12 @@ void FilterUniquePage::setPreviewStage(PreviewStage stage)
         m_previewTitle->setText(m_previewMatched ? QStringLiteral("第一次确认：将删除匹配的文件")
                                                  : QStringLiteral("第一次确认：将删除不匹配的文件"));
         m_previewHint->setText(
-            QStringLiteral("请核对下面的 %1 个文件。此时尚未删除任何文件，所选目录也不会被改动。")
+            QStringLiteral("请核对下面列出的全部 %1 个文件。现在还没有删除任何文件，所选目录也不会被改动。")
                 .arg(m_pendingPaths.size()));
     } else {
         m_previewTitle->setText(QStringLiteral("第二次确认"));
         m_previewHint->setText(
-            QStringLiteral("再次确认后才会删除上面列出的 %1 个文件，此操作不可恢复。不会删除所选目录，也不会删除任何子目录。")
+            QStringLiteral("再确认一次后，才会删除上面这 %1 个文件，删掉后无法恢复。不会删除所选目录，也不会删除任何子目录。")
                 .arg(m_pendingPaths.size()));
     }
     updateUi();
@@ -1198,13 +1343,6 @@ QStringList FilterUniquePage::pathsFor(bool matched) const
             paths.append(row.absolutePath);
     }
     return paths;
-}
-
-void FilterUniquePage::setBusyDetail(const QString &text)
-{
-    if (m_aborting || !m_busy || !m_detail)
-        return;
-    m_detail->setText(text);
 }
 
 ToolInfo FilterUniqueTool::info() const
