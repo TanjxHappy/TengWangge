@@ -14,6 +14,8 @@
 #include <QFileInfo>
 #include <QJsonDocument>
 #include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QSplitter>
@@ -572,17 +574,44 @@ void EditorTests::dualPaneFitsTypicalWindow()
 
     auto *page = window.findChild<HighCheckPage *>();
     QVERIFY(page != nullptr);
-    page->editSourceText(QStringLiteral("{\"名称\":\"滕王阁\",\"port\":8080,\"items\":[1,2]}"));
+    QTest::qWait(50);
+    QVERIFY(window.grab().save(QStringLiteral("/tmp/param-check-high-empty.png"), "PNG"));
+
+    const QString path = dir.filePath(QStringLiteral("pavilion.json"));
+    QVERIFY(writeBytes(path, QByteArray("{\n  \"名称\": \"滕王阁\",\n  \"port\": 8080,\n  \"items\": [1, 2]\n}\n")));
+    QVERIFY2(page->openFile(path, &error), qPrintable(error));
     QVERIFY(page->treeInSync());
+    auto *tree = page->findChild<QTreeView *>();
+    QVERIFY(tree != nullptr);
+    tree->setCurrentIndex(tree->model()->index(1, 0));
     QTest::qWait(50);
 
-    auto *splitter = page->findChild<QSplitter *>();
-    QVERIFY(splitter != nullptr);
-    QVERIFY2(splitter->count() == 2, qPrintable(QString::number(splitter->count())));
-    QVERIFY2(splitter->widget(0)->width() > 200, qPrintable(QString::number(splitter->widget(0)->width())));
-    QVERIFY2(splitter->widget(1)->width() > 200, qPrintable(QString::number(splitter->widget(1)->width())));
+    auto *work = page->findChild<QSplitter *>(QStringLiteral("workSplit"));
+    auto *stack = page->findChild<QSplitter *>(QStringLiteral("stackSplit"));
+    auto *property = page->findChild<QWidget *>(QStringLiteral("propertyPane"));
+    auto *problems = page->findChild<QListWidget *>(QStringLiteral("problemList"));
+    QVERIFY(work != nullptr);
+    QVERIFY(stack != nullptr);
+    QVERIFY(property != nullptr);
+    QVERIFY(problems != nullptr);
+    QCOMPARE(work->count(), 3);
+    QCOMPARE(stack->count(), 2);
+    for (int i = 0; i < 3; ++i) {
+        QVERIFY2(work->widget(i)->isVisible(), qPrintable(QString::number(i)));
+        QVERIFY2(work->widget(i)->width() > 140, qPrintable(QString::number(work->widget(i)->width())));
+        QVERIFY2(work->widget(i)->height() > 80, qPrintable(QString::number(work->widget(i)->height())));
+    }
+    QVERIFY(stack->widget(0)->isVisible());
+    QVERIFY(stack->widget(1)->isVisible());
+    QVERIFY2(stack->widget(1)->height() > 60, qPrintable(QString::number(stack->widget(1)->height())));
     QVERIFY(page->findChild<QPlainTextEdit *>()->isVisible());
-    QVERIFY(page->findChild<QTreeView *>()->isVisible());
+    QVERIFY(tree->isVisible());
+    QVERIFY(property->isVisible());
+    QVERIFY(problems->isVisible());
+    auto *name = page->findChild<QLineEdit *>(QStringLiteral("propName"));
+    QVERIFY(name != nullptr);
+    QCOMPARE(name->text(), QStringLiteral("port"));
+    QCOMPARE(page->findChild<QPlainTextEdit *>()->textCursor().blockNumber() + 1, 3);
     QVERIFY(window.grab().save(QStringLiteral("/tmp/param-check-high-1180.png"), "PNG"));
 
     page->editSourceText(QStringLiteral("{\"a\":"));
@@ -592,8 +621,9 @@ void EditorTests::dualPaneFitsTypicalWindow()
 
     window.resize(1024, 700);
     QTest::qWait(50);
-    QVERIFY2(splitter->widget(0)->width() > 160, qPrintable(QString::number(splitter->widget(0)->width())));
-    QVERIFY2(splitter->widget(1)->width() > 160, qPrintable(QString::number(splitter->widget(1)->width())));
+    for (int i = 0; i < 3; ++i)
+        QVERIFY2(work->widget(i)->width() > 100, qPrintable(QString::number(work->widget(i)->width())));
+    QVERIFY2(stack->widget(1)->height() > 48, qPrintable(QString::number(stack->widget(1)->height())));
 }
 
 int main(int argc, char **argv)

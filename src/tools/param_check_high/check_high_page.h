@@ -6,7 +6,11 @@
 #include <QWidget>
 
 class QComboBox;
+class QEvent;
 class QLabel;
+class QLineEdit;
+class QListWidget;
+class QListWidgetItem;
 class QPlainTextEdit;
 class QPushButton;
 class QResizeEvent;
@@ -19,7 +23,7 @@ namespace tw {
 class ElidedLabel;
 class StructureModel;
 
-// 左边是源文本，右边是可编辑结构树。只有用户保存时才写文件。
+// 原文、结构树、属性表单和问题列表四块对照。只有用户保存时才写文件。
 class HighCheckPage : public QWidget
 {
     Q_OBJECT
@@ -46,6 +50,7 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 private:
     void buildUi();
@@ -61,13 +66,25 @@ private:
     void onAddAttribute();
     void onRemove();
     void onTypeChanged(int index);
+    void onExpandAll();
+    void onCollapseAll();
+    void findStep(bool backward);
     void refreshChrome();
+    void fillProperty(const QModelIndex &current);
+    void applyPropertyName();
+    void applyPropertyValue();
+    void refreshProblems();
+    void focusSourceLine(int line, int column);
+    void selectNodeForCursor();
+    void openNodeDialog(const QModelIndex &index);
+    QString pathText(const Node *node) const;
     void setBanner(const QString &text, bool error);
     void markLine(int line, int column);
     void updatePathLabel();
     bool confirmDiscard();
     Notation requested() const;
     static int countNodes(const Node *node);
+    static Node *deepestCovering(Node *node, int line, int column, Node *best);
 
     ToolServices m_services;
     QString m_dataDir;
@@ -88,17 +105,30 @@ private:
     bool m_crlf = false;
     bool m_splitApplied = false;
     bool m_busy = false;
+    bool m_fromTree = false;
+    bool m_formQuiet = false;
     int m_ticket = 0;
+    int m_errorLine = 0;
+    int m_errorColumn = 0;
 
     StructureModel *m_model = nullptr;
     QPlainTextEdit *m_source = nullptr;
     QTreeView *m_tree = nullptr;
     QSplitter *m_splitter = nullptr;
+    QSplitter *m_stack = nullptr;
     QComboBox *m_format = nullptr;
     QComboBox *m_type = nullptr;
+    QLineEdit *m_find = nullptr;
+    QLineEdit *m_propName = nullptr;
+    QLineEdit *m_propValue = nullptr;
     QLabel *m_detected = nullptr;
-    QLabel *m_banner = nullptr;
+    QLabel *m_propKind = nullptr;
+    QLabel *m_propLine = nullptr;
+    QLabel *m_propChildren = nullptr;
+    ElidedLabel *m_banner = nullptr;
     ElidedLabel *m_pathLabel = nullptr;
+    ElidedLabel *m_propPath = nullptr;
+    QListWidget *m_problems = nullptr;
     QPushButton *m_open = nullptr;
     QPushButton *m_save = nullptr;
     QPushButton *m_saveAs = nullptr;

@@ -42,6 +42,9 @@ struct Node {
     QString spelling;
     bool quoted = false;
     bool cdata = false;
+    // 在原文中的位置。0 表示还没有对应行（例如结构刚改完、还没重新对上）。
+    int line = 0;
+    int column = 1;
     Node *parent = nullptr;
     std::vector<std::unique_ptr<Node>> children;
 

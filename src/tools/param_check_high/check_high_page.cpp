@@ -7,12 +7,17 @@
 
 #include <QAbstractItemView>
 #include <QComboBox>
+#include <QDialog>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFont>
+#include <QFormLayout>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
+#include <QLineEdit>
+#include <QListWidget>
 #include <QMessageBox>
 #include <QPaintEvent>
 #include <QPainter>
@@ -210,6 +215,8 @@ bool HighCheckPage::openFile(const QString &path, QString *error)
         m_model->resetSheet(Sheet(), true);
         m_tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
         m_error = utf8Refusal();
+        m_errorLine = 1;
+        m_errorColumn = 1;
         setBanner(QStringLiteral("需要修改：") + m_error, true);
         m_services.showStatus(StatusState::Error, m_error);
         m_services.logError(m_error);
@@ -348,34 +355,31 @@ bool HighCheckPage::setNodeText(const QStringList &path, const QString &value)
 void HighCheckPage::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    if (m_splitApplied || m_splitter == nullptr || m_splitter->width() < 480)
+    if (m_splitApplied || m_splitter == nullptr || m_stack == nullptr || m_splitter->width() < 480
+        || m_stack->height() < 180)
         return;
     m_splitApplied = true;
-    if (!m_pendingSplitter.isEmpty()) {
+    if (!m_pendingSplitter.isEmpty())
         m_splitter->restoreState(m_pendingSplitter);
-        return;
+    else {
+        const int width = m_splitter->width();
+        const int source = width * 34 / 100;
+        const int tree = width * 38 / 100;
+        m_splitter->setSizes({source, tree, qMax(1, width - source - tree)});
     }
-    const int left = m_splitter->width() / 2;
-    m_splitter->setSizes({left, qMax(1, m_splitter->width() - left)});
+    const int height = m_stack->height();
+    const int bottom = qBound(88, height / 5, 132);
+    m_stack->setSizes({qMax(1, height - bottom), bottom});
 }
 
 void HighCheckPage::buildUi()
 {
     auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(12, 8, 12, 8);
-    layout->setSpacing(6);
-
-    auto *title = roleLabel(QStringLiteral("参数检查high"), "pageTitle");
-    layout->addWidget(title);
-    auto *subtitle = roleLabel(
-        QStringLiteral("左边是原文，右边是结构。改任意一边，另一边会跟着变。"
-                       "检查没通过时，右边停在上次成功的结构并且不能编辑。"),
-        "pageSubtitle");
-    subtitle->setWordWrap(true);
-    layout->addWidget(subtitle);
+    layout->setContentsMargins(8, 4, 8, 4);
+    layout->setSpacing(4);
 
     auto *toolbar = new QHBoxLayout;
-    toolbar->setSpacing(8);
+    toolbar->setSpacing(6);
     m_open = new QPushButton(QStringLiteral("打开"));
     m_save = new QPushButton(QStringLiteral("保存"));
     m_save->setProperty("role", QStringLiteral("primary"));
@@ -383,6 +387,11 @@ void HighCheckPage::buildUi()
     m_open->setAccessibleName(QStringLiteral("打开"));
     m_save->setAccessibleName(QStringLiteral("保存"));
     m_saveAs->setAccessibleName(QStringLiteral("另存为"));
+    m_open->setToolTip(QStringLiteral("打开 JSON、XML 或 INI 参数文件。"));
+    m_save->setToolTip(QStringLiteral(
+        "把窗口里的文本写回当前文件。保存前不会改磁盘。"
+        "会尽量保留原来的 UTF-8、BOM 和换行。不是 UTF-8 的文件不能写回原路径。"));
+    m_saveAs->setToolTip(QStringLiteral("另存为一个新的 UTF-8 文件。"));
     toolbar->addWidget(m_open);
     toolbar->addWidget(m_save);
     toolbar->addWidget(m_saveAs);
@@ -393,13 +402,33 @@ void HighCheckPage::buildUi()
     m_format->addItem(QStringLiteral("JSON"), static_cast<int>(Notation::Json));
     m_format->addItem(QStringLiteral("XML"), static_cast<int>(Notation::Xml));
     m_format->addItem(QStringLiteral("INI"), static_cast<int>(Notation::Ini));
-    m_format->setMinimumWidth(108);
+    m_format->setMinimumWidth(96);
     toolbar->addWidget(m_format);
+    m_find = new QLineEdit;
+    m_find->setObjectName(QStringLiteral("findEdit"));
+    m_find->setAccessibleName(QStringLiteral("查找"));
+    m_find->setPlaceholderText(QStringLiteral("查找名称或值"));
+    m_find->setClearButtonEnabled(true);
+    m_find->setMinimumWidth(96);
+    m_find->setMaximumWidth(168);
+    m_find->setToolTip(QStringLiteral("在结构和原文里查找。回车跳到下一处，Ctrl+F 回到这里。"));
+    toolbar->addWidget(m_find);
+    auto *findNext = new QPushButton(QStringLiteral("下一个"));
+    auto *findPrev = new QPushButton(QStringLiteral("上一个"));
+    findNext->setToolTip(QStringLiteral("跳到下一处匹配。"));
+    findPrev->setToolTip(QStringLiteral("跳到上一处匹配。"));
+    toolbar->addWidget(findPrev);
+    toolbar->addWidget(findNext);
+    auto *expandAll = new QPushButton(QStringLiteral("展开"));
+    auto *collapseAll = new QPushButton(QStringLiteral("折叠"));
+    expandAll->setToolTip(QStringLiteral("展开结构树。节点很多时只展开前几层。"));
+    collapseAll->setToolTip(QStringLiteral("折叠结构树。"));
+    toolbar->addWidget(expandAll);
+    toolbar->addWidget(collapseAll);
     m_detected = roleLabel(QStringLiteral("尚未识别"), "fieldLabel");
     m_detected->setAccessibleName(QStringLiteral("识别出的格式"));
     m_detected->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
     toolbar->addWidget(m_detected);
-    toolbar->addStretch(1);
     m_pathLabel = new ElidedLabel;
     m_pathLabel->setProperty("role", QStringLiteral("value"));
     m_pathLabel->setAccessibleName(QStringLiteral("当前文件"));
@@ -408,11 +437,14 @@ void HighCheckPage::buildUi()
     toolbar->addWidget(m_pathLabel, 1);
     layout->addLayout(toolbar);
 
-    m_banner = new QLabel;
-    m_banner->setWordWrap(true);
-    m_banner->setMaximumHeight(72);
-    m_banner->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    m_banner = new ElidedLabel;
     m_banner->setAccessibleName(QStringLiteral("检查结果"));
+    m_banner->setFullText(QStringLiteral(
+        "单击在原文、结构和属性之间定位。双击节点可编辑。点「保存」才写入文件。"));
+    m_banner->setToolTip(QStringLiteral(
+        "左边是原文，中间是结构，右边是当前节点的属性。"
+        "检查没通过时，原文保留并标出行号，结构停在上次成功的结果且不能编辑。"
+        "只有点「保存」才写入文件，并尽量保持原来的 UTF-8、BOM 和换行。"));
     layout->addWidget(m_banner);
 
     m_model = new StructureModel(this);
@@ -429,6 +461,7 @@ void HighCheckPage::buildUi()
                       QStringLiteral("DejaVu Sans Mono")});
     font.setPointSize(10);
     m_source->setFont(font);
+    m_source->viewport()->installEventFilter(this);
 
     m_tree = new QTreeView;
     m_tree->setObjectName(QStringLiteral("structureTree"));
@@ -440,66 +473,134 @@ void HighCheckPage::buildUi()
     m_tree->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_tree->setSelectionMode(QAbstractItemView::SingleSelection);
     m_tree->setAllColumnsShowFocus(true);
+    m_tree->setExpandsOnDoubleClick(false);
     m_tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_tree->header()->setStretchLastSection(true);
+    m_tree->header()->setMinimumSectionSize(56);
     m_tree->header()->setSectionResizeMode(0, QHeaderView::Interactive);
-    m_tree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_tree->header()->setSectionResizeMode(1, QHeaderView::Interactive);
     m_tree->header()->setSectionResizeMode(2, QHeaderView::Stretch);
-    m_tree->setColumnWidth(0, 168);
+    m_tree->setColumnWidth(0, 108);
+    m_tree->setColumnWidth(1, 64);
+    m_tree->setToolTip(QStringLiteral("单击定位到原文和属性。双击打开节点详情。"));
 
-    auto *leftPane = new QWidget;
-    auto *leftLayout = new QVBoxLayout(leftPane);
-    leftLayout->setContentsMargins(0, 0, 0, 0);
-    leftLayout->setSpacing(4);
-    leftLayout->addWidget(roleLabel(QStringLiteral("源文本"), "sectionTitle"));
-    leftLayout->addWidget(m_source, 1);
-    leftPane->setMinimumWidth(220);
+    auto *sourcePane = new QWidget;
+    sourcePane->setObjectName(QStringLiteral("sourcePane"));
+    auto *sourceLayout = new QVBoxLayout(sourcePane);
+    sourceLayout->setContentsMargins(0, 0, 0, 0);
+    sourceLayout->setSpacing(2);
+    sourceLayout->addWidget(roleLabel(QStringLiteral("源文本"), "sectionTitle"));
+    sourceLayout->addWidget(m_source, 1);
+    sourcePane->setMinimumWidth(168);
 
-    auto *rightPane = new QWidget;
-    auto *rightLayout = new QVBoxLayout(rightPane);
-    rightLayout->setContentsMargins(0, 0, 0, 0);
-    rightLayout->setSpacing(4);
-    rightLayout->addWidget(roleLabel(QStringLiteral("结构"), "sectionTitle"));
-    rightLayout->addWidget(m_tree, 1);
+    auto *treePane = new QWidget;
+    treePane->setObjectName(QStringLiteral("treePane"));
+    auto *treeLayout = new QVBoxLayout(treePane);
+    treeLayout->setContentsMargins(0, 0, 0, 0);
+    treeLayout->setSpacing(2);
+    treeLayout->addWidget(roleLabel(QStringLiteral("结构"), "sectionTitle"));
+    treeLayout->addWidget(m_tree, 1);
+    treePane->setMinimumWidth(168);
+
+    auto *property = new QWidget;
+    property->setObjectName(QStringLiteral("propertyPane"));
+    property->setMinimumWidth(188);
+    auto *propertyLayout = new QVBoxLayout(property);
+    propertyLayout->setContentsMargins(0, 0, 0, 0);
+    propertyLayout->setSpacing(4);
+    propertyLayout->addWidget(roleLabel(QStringLiteral("属性"), "sectionTitle"));
+
     auto *actions = new QHBoxLayout;
-    actions->setSpacing(8);
+    actions->setSpacing(6);
     m_add = new QPushButton(QStringLiteral("添加"));
-    m_addAttribute = new QPushButton(QStringLiteral("添加属性"));
     m_remove = new QPushButton(QStringLiteral("删除"));
-    m_remove->setProperty("role", QStringLiteral("danger"));
     m_add->setAccessibleName(QStringLiteral("添加"));
-    m_addAttribute->setAccessibleName(QStringLiteral("添加属性"));
     m_remove->setAccessibleName(QStringLiteral("删除"));
+    m_add->setToolTip(QStringLiteral("在当前节点下添加一项。"));
+    m_remove->setToolTip(QStringLiteral("删除当前选中的节点。"));
+    actions->addWidget(m_add);
+    actions->addWidget(m_remove);
+    actions->addStretch(1);
+    propertyLayout->addLayout(actions);
+
+    m_addAttribute = new QPushButton(QStringLiteral("添加属性"));
+    m_addAttribute->setAccessibleName(QStringLiteral("添加属性"));
+    m_addAttribute->setToolTip(QStringLiteral("给选中的 XML 元素加一个属性。"));
+    propertyLayout->addWidget(m_addAttribute);
+
+    auto *typeRow = new QHBoxLayout;
+    typeRow->setSpacing(6);
+    typeRow->addWidget(roleLabel(QStringLiteral("类型"), "fieldLabel"));
     m_type = new QComboBox;
     m_type->setAccessibleName(QStringLiteral("值的类型"));
     m_type->addItem(QStringLiteral("字符串"), static_cast<int>(NodeKind::Phrase));
     m_type->addItem(QStringLiteral("数字"), static_cast<int>(NodeKind::Quantity));
     m_type->addItem(QStringLiteral("布尔"), static_cast<int>(NodeKind::Switch));
     m_type->addItem(QStringLiteral("空"), static_cast<int>(NodeKind::Vacant));
-    actions->addWidget(m_add);
-    actions->addWidget(m_addAttribute);
-    actions->addWidget(m_remove);
-    actions->addStretch(1);
-    actions->addWidget(roleLabel(QStringLiteral("类型"), "fieldLabel"));
-    actions->addWidget(m_type);
-    rightLayout->addLayout(actions);
-    rightPane->setMinimumWidth(240);
+    typeRow->addWidget(m_type, 1);
+    propertyLayout->addLayout(typeRow);
+
+    m_propPath = new ElidedLabel;
+    m_propPath->setObjectName(QStringLiteral("propPath"));
+    m_propPath->setProperty("role", QStringLiteral("value"));
+    m_propLine = roleLabel(QStringLiteral("—"), "hint");
+    m_propLine->setObjectName(QStringLiteral("propLine"));
+    m_propKind = roleLabel(QStringLiteral("—"), "value");
+    m_propKind->setObjectName(QStringLiteral("propKind"));
+    m_propChildren = roleLabel(QStringLiteral("—"), "hint");
+    m_propName = new QLineEdit;
+    m_propName->setObjectName(QStringLiteral("propName"));
+    m_propName->setAccessibleName(QStringLiteral("节点名称"));
+    m_propValue = new QLineEdit;
+    m_propValue->setObjectName(QStringLiteral("propValue"));
+    m_propValue->setAccessibleName(QStringLiteral("节点的值"));
+    auto *form = new QFormLayout;
+    form->setContentsMargins(0, 0, 0, 0);
+    form->setHorizontalSpacing(6);
+    form->setVerticalSpacing(4);
+    form->addRow(roleLabel(QStringLiteral("路径"), "fieldLabel"), m_propPath);
+    form->addRow(roleLabel(QStringLiteral("位置"), "fieldLabel"), m_propLine);
+    form->addRow(roleLabel(QStringLiteral("种类"), "fieldLabel"), m_propKind);
+    form->addRow(roleLabel(QStringLiteral("名称"), "fieldLabel"), m_propName);
+    form->addRow(roleLabel(QStringLiteral("值"), "fieldLabel"), m_propValue);
+    form->addRow(roleLabel(QStringLiteral("下级"), "fieldLabel"), m_propChildren);
+    propertyLayout->addLayout(form);
+    propertyLayout->addStretch(1);
 
     m_splitter = new QSplitter(Qt::Horizontal);
-    m_splitter->setObjectName(QStringLiteral("paramSplit"));
+    m_splitter->setObjectName(QStringLiteral("workSplit"));
     m_splitter->setChildrenCollapsible(false);
     m_splitter->setHandleWidth(6);
-    m_splitter->addWidget(leftPane);
-    m_splitter->addWidget(rightPane);
-    m_splitter->setStretchFactor(0, 1);
-    m_splitter->setStretchFactor(1, 1);
-    layout->addWidget(m_splitter, 1);
+    m_splitter->addWidget(sourcePane);
+    m_splitter->addWidget(treePane);
+    m_splitter->addWidget(property);
+    m_splitter->setStretchFactor(0, 3);
+    m_splitter->setStretchFactor(1, 4);
+    m_splitter->setStretchFactor(2, 3);
 
-    auto *hint = roleLabel(
-        QStringLiteral("修改会先留在窗口里。点「保存」才写入文件，并尽量保持原来的 UTF-8、BOM 和换行。"),
-        "hint");
-    hint->setWordWrap(true);
-    layout->addWidget(hint);
+    auto *problemPane = new QWidget;
+    problemPane->setObjectName(QStringLiteral("problemPane"));
+    problemPane->setMinimumHeight(84);
+    auto *problemLayout = new QVBoxLayout(problemPane);
+    problemLayout->setContentsMargins(0, 0, 0, 0);
+    problemLayout->setSpacing(2);
+    auto *problemTitle = roleLabel(QStringLiteral("问题"), "sectionTitle");
+    problemTitle->setToolTip(QStringLiteral("单击一条问题，原文会跳到对应的行。"));
+    m_problems = new QListWidget;
+    m_problems->setObjectName(QStringLiteral("problemList"));
+    m_problems->setAccessibleName(QStringLiteral("问题列表"));
+    problemLayout->addWidget(problemTitle);
+    problemLayout->addWidget(m_problems, 1);
+
+    m_stack = new QSplitter(Qt::Vertical);
+    m_stack->setObjectName(QStringLiteral("stackSplit"));
+    m_stack->setChildrenCollapsible(false);
+    m_stack->setHandleWidth(6);
+    m_stack->addWidget(m_splitter);
+    m_stack->addWidget(problemPane);
+    m_stack->setStretchFactor(0, 5);
+    m_stack->setStretchFactor(1, 1);
+    layout->addWidget(m_stack, 1);
 
     m_debounce = new QTimer(this);
     m_debounce->setSingleShot(true);
@@ -509,6 +610,8 @@ void HighCheckPage::buildUi()
     saveShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     auto *openShortcut = new QShortcut(QKeySequence::Open, this);
     openShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+    auto *findShortcut = new QShortcut(QKeySequence::Find, this);
+    findShortcut->setContext(Qt::WidgetWithChildrenShortcut);
 
     connect(m_open, &QPushButton::clicked, this, [this] { onOpen(); });
     connect(m_save, &QPushButton::clicked, this, [this] { onSave(); });
@@ -516,8 +619,17 @@ void HighCheckPage::buildUi()
     connect(m_add, &QPushButton::clicked, this, [this] { onAdd(); });
     connect(m_addAttribute, &QPushButton::clicked, this, [this] { onAddAttribute(); });
     connect(m_remove, &QPushButton::clicked, this, [this] { onRemove(); });
+    connect(expandAll, &QPushButton::clicked, this, [this] { onExpandAll(); });
+    connect(collapseAll, &QPushButton::clicked, this, [this] { onCollapseAll(); });
+    connect(findNext, &QPushButton::clicked, this, [this] { findStep(false); });
+    connect(findPrev, &QPushButton::clicked, this, [this] { findStep(true); });
+    connect(m_find, &QLineEdit::returnPressed, this, [this] { findStep(false); });
     connect(openShortcut, &QShortcut::activated, this, [this] { onOpen(); });
     connect(saveShortcut, &QShortcut::activated, this, [this] { onSave(); });
+    connect(findShortcut, &QShortcut::activated, this, [this] {
+        m_find->setFocus();
+        m_find->selectAll();
+    });
     connect(m_format, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
         if (m_quiet)
             return;
@@ -532,6 +644,8 @@ void HighCheckPage::buildUi()
     connect(m_type, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
         onTypeChanged(index);
     });
+    connect(m_propName, &QLineEdit::editingFinished, this, [this] { applyPropertyName(); });
+    connect(m_propValue, &QLineEdit::editingFinished, this, [this] { applyPropertyValue(); });
     connect(m_source, &QPlainTextEdit::textChanged, this, [this] {
         if (m_quiet)
             return;
@@ -543,6 +657,7 @@ void HighCheckPage::buildUi()
         refreshChrome();
         m_debounce->start();
     });
+    connect(m_source, &QPlainTextEdit::cursorPositionChanged, this, [this] { selectNodeForCursor(); });
     connect(m_debounce, &QTimer::timeout, this, [this] {
         const QString text = m_source->toPlainText();
         if (text.size() >= 48 * 1024)
@@ -555,20 +670,35 @@ void HighCheckPage::buildUi()
         setBanner(reason, true);
         m_services.showStatus(StatusState::Error, reason);
     });
-    connect(m_tree->selectionModel(), &QItemSelectionModel::currentChanged, this, [this](const QModelIndex &,
-                                                                                        const QModelIndex &) {
-        refreshChrome();
+    connect(m_tree, &QTreeView::doubleClicked, this, [this](const QModelIndex &index) { openNodeDialog(index); });
+    connect(m_tree->selectionModel(), &QItemSelectionModel::currentChanged, this,
+            [this](const QModelIndex &current, const QModelIndex &) {
+                refreshChrome();
+                if (m_fromTree)
+                    return;
+                const Node *node = m_model->nodeAt(current);
+                if (node != nullptr && node->line > 0)
+                    focusSourceLine(node->line, node->column);
+            });
+    connect(m_problems, &QListWidget::itemClicked, this, [this](QListWidgetItem *item) {
+        const int line = item->data(Qt::UserRole).toInt();
+        const int column = qMax(1, item->data(Qt::UserRole + 1).toInt());
+        if (line >= 1)
+            focusSourceLine(line, column);
     });
 
     setTabOrder(m_open, m_save);
     setTabOrder(m_save, m_saveAs);
     setTabOrder(m_saveAs, m_format);
-    setTabOrder(m_format, m_source);
+    setTabOrder(m_format, m_find);
+    setTabOrder(m_find, m_source);
     setTabOrder(m_source, m_tree);
-    setTabOrder(m_tree, m_add);
-    setTabOrder(m_add, m_addAttribute);
-    setTabOrder(m_addAttribute, m_remove);
-    setTabOrder(m_remove, m_type);
+    setTabOrder(m_tree, m_propName);
+    setTabOrder(m_propName, m_propValue);
+    setTabOrder(m_propValue, m_add);
+    setTabOrder(m_add, m_remove);
+    setTabOrder(m_remove, m_addAttribute);
+    setTabOrder(m_addAttribute, m_type);
     updatePathLabel();
 }
 
@@ -577,6 +707,8 @@ void HighCheckPage::applyIdle()
     m_busy = false;
     m_treeInSync = false;
     m_error.clear();
+    m_errorLine = 0;
+    m_errorColumn = 0;
     m_model->setLocked(true);
     m_tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
     markLine(0, 0);
@@ -635,6 +767,8 @@ void HighCheckPage::adopt(Sheet sheet)
         m_model->setLocked(true);
         m_tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
         m_error = sheet.message;
+        m_errorLine = sheet.line;
+        m_errorColumn = sheet.column;
         setBanner(QStringLiteral("需要修改：") + m_error, true);
         markLine(sheet.line, sheet.column);
         m_services.showStatus(StatusState::Error, m_error);
@@ -648,12 +782,13 @@ void HighCheckPage::adopt(Sheet sheet)
 
     m_error.clear();
     m_loggedError.clear();
+    m_errorLine = 0;
+    m_errorColumn = 0;
     m_treeInSync = true;
     m_active = sheet.notation;
     const int nodes = countNodes(sheet.root.get());
     m_model->resetSheet(std::move(sheet), false);
-    m_tree->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed
-                            | QAbstractItemView::AnyKeyPressed);
+    m_tree->setEditTriggers(QAbstractItemView::EditKeyPressed | QAbstractItemView::AnyKeyPressed);
     if (nodes > 800)
         m_tree->collapseAll();
     else
@@ -691,6 +826,12 @@ void HighCheckPage::onStructureEdited()
     m_applying = false;
     m_treeInSync = true;
     m_error.clear();
+    m_errorLine = 0;
+    m_errorColumn = 0;
+    const Notation notation = m_active == Notation::Automatic ? requested() : m_active;
+    const Sheet fresh = parseSheet(text, notation, m_suffix);
+    if (fresh.ok)
+        m_model->transplantLines(fresh);
     m_dirty = text != m_savedText;
     markLine(0, 0);
     setBanner(QStringLiteral("右边的修改已经反映到左边。点「保存」才会写入文件。"), false);
@@ -796,6 +937,9 @@ void HighCheckPage::refreshChrome()
         m_detected->setText(QStringLiteral("未通过"));
     m_detected->setMinimumWidth(m_detected->fontMetrics().horizontalAdvance(m_detected->text()) + 12);
 
+    fillProperty(current);
+    refreshProblems();
+
     const QString kindText = current.isValid()
                                  ? m_model->data(current.sibling(current.row(), 1), Qt::DisplayRole).toString()
                                  : QString();
@@ -813,8 +957,7 @@ void HighCheckPage::refreshChrome()
 
 void HighCheckPage::setBanner(const QString &text, bool error)
 {
-    m_banner->setText(text);
-    m_banner->setToolTip(text);
+    m_banner->setFullText(text);
     m_banner->setProperty("role", error ? QStringLiteral("fieldLabel") : QStringLiteral("hint"));
     m_banner->style()->unpolish(m_banner);
     m_banner->style()->polish(m_banner);
@@ -881,6 +1024,324 @@ Notation HighCheckPage::requested() const
         break;
     }
     return Notation::Automatic;
+}
+
+void HighCheckPage::onExpandAll()
+{
+    if (countNodes(m_model->sheet().root.get()) > 800) {
+        m_tree->expandToDepth(2);
+        setBanner(QStringLiteral("节点较多，只展开了前几层，以免界面卡住。"), false);
+        return;
+    }
+    m_tree->expandAll();
+}
+
+void HighCheckPage::onCollapseAll()
+{
+    m_tree->collapseAll();
+}
+
+void HighCheckPage::findStep(bool backward)
+{
+    const QString needle = m_find->text().trimmed();
+    if (needle.isEmpty()) {
+        setBanner(QStringLiteral("请先在查找框里输入名称或值。"), true);
+        m_find->setFocus();
+        return;
+    }
+
+    QList<QModelIndex> hits;
+    const auto walk = [&](auto &&self, const QModelIndex &parent) -> void {
+        const int rows = m_model->rowCount(parent);
+        for (int row = 0; row < rows; ++row) {
+            const QModelIndex nameIndex = m_model->index(row, 0, parent);
+            const QString name = m_model->data(nameIndex, Qt::DisplayRole).toString();
+            const QString value = m_model->data(nameIndex.sibling(nameIndex.row(), 2), Qt::DisplayRole).toString();
+            if (name.contains(needle, Qt::CaseInsensitive) || value.contains(needle, Qt::CaseInsensitive))
+                hits.append(nameIndex);
+            self(self, nameIndex);
+        }
+    };
+    walk(walk, QModelIndex());
+
+    if (!hits.isEmpty()) {
+        int current = -1;
+        const QModelIndex selected = m_tree->currentIndex().sibling(m_tree->currentIndex().row(), 0);
+        for (int i = 0; i < hits.size(); ++i) {
+            if (hits.at(i) == selected) {
+                current = i;
+                break;
+            }
+        }
+        int next = 0;
+        if (current >= 0) {
+            next = backward ? (current - 1 + hits.size()) % hits.size() : (current + 1) % hits.size();
+        } else if (backward) {
+            next = hits.size() - 1;
+        }
+        m_tree->setCurrentIndex(hits.at(next));
+        m_tree->scrollTo(hits.at(next));
+        setBanner(QStringLiteral("找到 %1 处，当前第 %2 处。").arg(hits.size()).arg(next + 1), false);
+        return;
+    }
+
+    const QString haystack = m_source->toPlainText();
+    const int from = m_source->textCursor().position();
+    int pos = -1;
+    if (backward)
+        pos = haystack.lastIndexOf(needle, qMax(0, from - 1), Qt::CaseInsensitive);
+    else
+        pos = haystack.indexOf(needle, from + 1, Qt::CaseInsensitive);
+    if (pos < 0) {
+        pos = backward ? haystack.lastIndexOf(needle, -1, Qt::CaseInsensitive)
+                       : haystack.indexOf(needle, 0, Qt::CaseInsensitive);
+    }
+    if (pos < 0) {
+        setBanner(QStringLiteral("没有找到「%1」。").arg(needle.left(40)), true);
+        return;
+    }
+    QTextCursor cursor = m_source->textCursor();
+    cursor.setPosition(pos);
+    cursor.setPosition(pos + needle.size(), QTextCursor::KeepAnchor);
+    m_fromTree = true;
+    m_source->setTextCursor(cursor);
+    m_source->ensureCursorVisible();
+    m_fromTree = false;
+    setBanner(QStringLiteral("在原文里找到了「%1」。").arg(needle.left(40)), false);
+}
+
+void HighCheckPage::fillProperty(const QModelIndex &current)
+{
+    m_formQuiet = true;
+    const Node *node = m_model->nodeAt(current);
+    if (node == nullptr) {
+        m_propPath->setFullText(QStringLiteral("未选中节点"));
+        m_propLine->setText(QStringLiteral("—"));
+        m_propKind->setText(QStringLiteral("—"));
+        m_propChildren->setText(QStringLiteral("—"));
+        m_propName->clear();
+        m_propValue->clear();
+        m_propName->setReadOnly(true);
+        m_propValue->setReadOnly(true);
+        m_formQuiet = false;
+        return;
+    }
+    m_propPath->setFullText(pathText(node));
+    if (node->line > 0)
+        m_propLine->setText(QStringLiteral("第 %1 行第 %2 列").arg(node->line).arg(qMax(1, node->column)));
+    else
+        m_propLine->setText(QStringLiteral("重新识别后才有行号"));
+    m_propKind->setText(nodeKindCaption(node->kind));
+    m_propChildren->setText(QStringLiteral("%1 项").arg(node->childCount()));
+    m_propName->setText(nodeLabel(node));
+    m_propValue->setText(displayedValue(node));
+    const bool locked = m_model->isLocked();
+    m_propName->setReadOnly(locked || !nodeNameEditable(node));
+    m_propValue->setReadOnly(locked || !nodeValueEditable(node));
+    m_formQuiet = false;
+}
+
+void HighCheckPage::applyPropertyName()
+{
+    if (m_formQuiet || m_model->isLocked())
+        return;
+    const QModelIndex current = m_tree->currentIndex();
+    if (!current.isValid())
+        return;
+    const QModelIndex nameIndex = current.sibling(current.row(), 0);
+    if (m_propName->text() == m_model->data(nameIndex, Qt::DisplayRole).toString())
+        return;
+    if (!m_model->setData(nameIndex, m_propName->text(), Qt::EditRole))
+        fillProperty(current);
+}
+
+void HighCheckPage::applyPropertyValue()
+{
+    if (m_formQuiet || m_model->isLocked())
+        return;
+    const QModelIndex current = m_tree->currentIndex();
+    if (!current.isValid())
+        return;
+    const QModelIndex valueIndex = current.sibling(current.row(), 2);
+    if (m_propValue->text() == m_model->data(valueIndex, Qt::DisplayRole).toString())
+        return;
+    if (!m_model->setData(valueIndex, m_propValue->text(), Qt::EditRole))
+        fillProperty(current);
+}
+
+void HighCheckPage::refreshProblems()
+{
+    if (m_problems == nullptr)
+        return;
+    m_problems->clear();
+    if (m_busy) {
+        m_problems->addItem(QStringLiteral("正在分析结构…"));
+        return;
+    }
+    if (!m_error.isEmpty()) {
+        auto *item = new QListWidgetItem(m_error);
+        item->setData(Qt::UserRole, m_errorLine);
+        item->setData(Qt::UserRole + 1, m_errorColumn);
+        item->setToolTip(QStringLiteral("单击后跳到原文的这一行。"));
+        m_problems->addItem(item);
+        return;
+    }
+    if (m_treeInSync) {
+        const int nodes = countNodes(m_model->sheet().root.get());
+        m_problems->addItem(QStringLiteral("没有问题。已识别为 %1，共 %2 项。")
+                                .arg(notationCaption(m_active))
+                                .arg(nodes));
+        return;
+    }
+    m_problems->addItem(QStringLiteral("还没有可检查的内容。"));
+}
+
+void HighCheckPage::focusSourceLine(int line, int column)
+{
+    if (line < 1 || m_source->document()->blockCount() < line)
+        return;
+    m_fromTree = true;
+    QTextCursor cursor(m_source->document());
+    cursor.movePosition(QTextCursor::Start);
+    if (line > 1)
+        cursor.movePosition(QTextCursor::Down, QTextCursor::MoveAnchor, line - 1);
+    if (column > 1) {
+        cursor.movePosition(QTextCursor::Right, QTextCursor::MoveAnchor,
+                            qMin(column - 1, qMax(0, cursor.block().length() - 1)));
+    }
+    m_source->setTextCursor(cursor);
+    m_source->ensureCursorVisible();
+
+    QList<QTextEdit::ExtraSelection> extras;
+    QTextEdit::ExtraSelection selection;
+    QColor wash = Theme::workbench().primary;
+    wash.setAlpha(36);
+    selection.format.setBackground(wash);
+    selection.format.setProperty(QTextFormat::FullWidthSelection, true);
+    selection.cursor = cursor;
+    extras.append(selection);
+    m_source->setExtraSelections(extras);
+    m_fromTree = false;
+}
+
+void HighCheckPage::selectNodeForCursor()
+{
+    if (m_quiet || m_fromTree || !m_treeInSync || m_model->sheet().root == nullptr)
+        return;
+    const int line = m_source->textCursor().blockNumber() + 1;
+    const int column = m_source->textCursor().positionInBlock() + 1;
+    Node *node = deepestCovering(m_model->sheet().root.get(), line, column, nullptr);
+    if (node == nullptr || node == m_model->sheet().root.get())
+        return;
+    const QModelIndex index = m_model->indexForNode(node);
+    if (!index.isValid() || index == m_tree->currentIndex())
+        return;
+    m_fromTree = true;
+    m_tree->setCurrentIndex(index);
+    m_tree->scrollTo(index);
+    m_fromTree = false;
+}
+
+QString HighCheckPage::pathText(const Node *node) const
+{
+    QStringList parts;
+    const Node *root = m_model->sheet().root.get();
+    for (const Node *cursor = node; cursor != nullptr && cursor != root; cursor = cursor->parent)
+        parts.prepend(nodeLabel(cursor));
+    if (parts.isEmpty())
+        return node == nullptr ? QString() : nodeLabel(node);
+    return parts.join(QLatin1Char('/'));
+}
+
+Node *HighCheckPage::deepestCovering(Node *node, int line, int column, Node *best)
+{
+    if (node == nullptr)
+        return best;
+    if (node->line > 0 && (node->line < line || (node->line == line && node->column <= column))) {
+        if (best == nullptr || node->line > best->line || (node->line == best->line && node->column >= best->column))
+            best = node;
+    }
+    for (int i = 0; i < node->childCount(); ++i)
+        best = deepestCovering(node->children[static_cast<size_t>(i)].get(), line, column, best);
+    return best;
+}
+
+void HighCheckPage::openNodeDialog(const QModelIndex &index)
+{
+    const Node *node = m_model->nodeAt(index);
+    if (node == nullptr)
+        return;
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("节点详情"));
+    dialog.setMinimumWidth(420);
+    auto *layout = new QVBoxLayout(&dialog);
+    auto *form = new QFormLayout;
+    auto *path = new ElidedLabel;
+    path->setProperty("role", QStringLiteral("value"));
+    path->setFullText(pathText(node));
+    auto *place = roleLabel(node->line > 0 ? QStringLiteral("第 %1 行第 %2 列").arg(node->line).arg(node->column)
+                                           : QStringLiteral("还没有行号"),
+                            "hint");
+    auto *kind = roleLabel(nodeKindCaption(node->kind), "value");
+    auto *name = new QLineEdit(nodeLabel(node));
+    auto *value = new QPlainTextEdit(displayedValue(node));
+    value->setMinimumHeight(72);
+    value->setMaximumHeight(140);
+    const bool locked = m_model->isLocked();
+    name->setReadOnly(locked || !nodeNameEditable(node));
+    value->setReadOnly(locked || !nodeValueEditable(node));
+    auto *type = new QComboBox;
+    type->addItem(QStringLiteral("字符串"), static_cast<int>(NodeKind::Phrase));
+    type->addItem(QStringLiteral("数字"), static_cast<int>(NodeKind::Quantity));
+    type->addItem(QStringLiteral("布尔"), static_cast<int>(NodeKind::Switch));
+    type->addItem(QStringLiteral("空"), static_cast<int>(NodeKind::Vacant));
+    const bool scalar = isJsonScalar(node);
+    type->setEnabled(!locked && scalar);
+    if (scalar) {
+        const int comboIndex = type->findData(static_cast<int>(node->kind));
+        if (comboIndex >= 0)
+            type->setCurrentIndex(comboIndex);
+    }
+    form->addRow(roleLabel(QStringLiteral("路径"), "fieldLabel"), path);
+    form->addRow(roleLabel(QStringLiteral("位置"), "fieldLabel"), place);
+    form->addRow(roleLabel(QStringLiteral("种类"), "fieldLabel"), kind);
+    form->addRow(roleLabel(QStringLiteral("名称"), "fieldLabel"), name);
+    if (scalar)
+        form->addRow(roleLabel(QStringLiteral("类型"), "fieldLabel"), type);
+    form->addRow(roleLabel(QStringLiteral("值"), "fieldLabel"), value);
+    layout->addLayout(form);
+    auto *buttons = new QHBoxLayout;
+    buttons->addStretch(1);
+    auto *cancel = new QPushButton(locked ? QStringLiteral("关闭") : QStringLiteral("取消"));
+    auto *ok = new QPushButton(QStringLiteral("确定"));
+    ok->setProperty("role", QStringLiteral("primary"));
+    ok->setVisible(!locked);
+    buttons->addWidget(ok);
+    buttons->addWidget(cancel);
+    layout->addLayout(buttons);
+    connect(cancel, &QPushButton::clicked, &dialog, &QDialog::reject);
+    connect(ok, &QPushButton::clicked, &dialog, &QDialog::accept);
+    if (dialog.exec() != QDialog::Accepted || locked)
+        return;
+    const QModelIndex nameIndex = index.sibling(index.row(), 0);
+    const QModelIndex valueIndex = index.sibling(index.row(), 2);
+    if (scalar) {
+        QString error;
+        m_model->setScalarKind(nameIndex, static_cast<NodeKind>(type->currentData().toInt()), &error);
+    }
+    if (!name->isReadOnly())
+        m_model->setData(nameIndex, name->text(), Qt::EditRole);
+    if (!value->isReadOnly())
+        m_model->setData(valueIndex, value->toPlainText(), Qt::EditRole);
+}
+
+bool HighCheckPage::eventFilter(QObject *watched, QEvent *event)
+{
+    if (m_source != nullptr && watched == m_source->viewport() && event->type() == QEvent::MouseButtonDblClick) {
+        selectNodeForCursor();
+        openNodeDialog(m_tree->currentIndex());
+    }
+    return QWidget::eventFilter(watched, event);
 }
 
 int HighCheckPage::countNodes(const Node *node)

@@ -330,6 +330,8 @@ private:
             return nullptr;
         if (depth > kMaxDepth)
             return failNode(QStringLiteral("嵌套超过 64 层，继续展开会把界面撑住。请把过深的层级拆开后再检查。"));
+        const int line = m_line;
+        const int column = qMax(1, m_column);
         const QChar character = peek();
         if (character == QLatin1Char('{'))
             return readObject(depth);
@@ -343,6 +345,8 @@ private:
             if (!node)
                 return nullptr;
             node->value = text;
+            node->line = line;
+            node->column = column;
             return node;
         }
         if (character == QLatin1Char('t') || character == QLatin1Char('f') || character == QLatin1Char('n')) {
@@ -351,6 +355,8 @@ private:
                 if (!node)
                     return nullptr;
                 node->value = QStringLiteral("true");
+                node->line = line;
+                node->column = column;
                 return node;
             }
             if (matchWord("false")) {
@@ -358,10 +364,18 @@ private:
                 if (!node)
                     return nullptr;
                 node->value = QStringLiteral("false");
+                node->line = line;
+                node->column = column;
                 return node;
             }
-            if (matchWord("null"))
-                return make(NodeKind::Vacant);
+            if (matchWord("null")) {
+                std::unique_ptr<Node> node = make(NodeKind::Vacant);
+                if (!node)
+                    return nullptr;
+                node->line = line;
+                node->column = column;
+                return node;
+            }
             return failNode(QStringLiteral("这里应该是 true、false 或 null。"));
         }
         if (character == QLatin1Char('-') || isAsciiDigit(character)) {
@@ -373,6 +387,8 @@ private:
                 return nullptr;
             node->spelling = spelling;
             node->value = spelling;
+            node->line = line;
+            node->column = column;
             return node;
         }
         if (character.isNull())
@@ -383,10 +399,14 @@ private:
 
     std::unique_ptr<Node> readObject(int depth)
     {
+        const int line = m_line;
+        const int column = qMax(1, m_column);
         next();
         std::unique_ptr<Node> object = make(NodeKind::Map);
         if (!object)
             return nullptr;
+        object->line = line;
+        object->column = column;
         skipSpace();
         if (peek() == QLatin1Char('}')) {
             next();
@@ -397,6 +417,8 @@ private:
             skipSpace();
             if (peek() != QLatin1Char('"'))
                 return failNode(QStringLiteral("对象的键需要用双引号括起来。"));
+            const int keyLine = m_line;
+            const int keyColumn = qMax(1, m_column);
             QString key;
             if (!readString(&key))
                 return nullptr;
@@ -416,6 +438,8 @@ private:
             if (!child)
                 return nullptr;
             child->name = key;
+            child->line = keyLine;
+            child->column = keyColumn;
             object->append(std::move(child));
             skipSpace();
             if (peek() == QLatin1Char(',')) {
@@ -438,10 +462,14 @@ private:
 
     std::unique_ptr<Node> readArray(int depth)
     {
+        const int line = m_line;
+        const int column = qMax(1, m_column);
         next();
         std::unique_ptr<Node> array = make(NodeKind::List);
         if (!array)
             return nullptr;
+        array->line = line;
+        array->column = column;
         skipSpace();
         if (peek() == QLatin1Char(']')) {
             next();
@@ -654,6 +682,8 @@ Sheet parseXml(const QString &text)
 
     auto root = std::make_unique<Node>();
     root->kind = NodeKind::Document;
+    root->line = 1;
+    root->column = 1;
     QXmlStreamReader reader(text);
     std::vector<Node *> stack;
     stack.push_back(root.get());
@@ -693,6 +723,8 @@ Sheet parseXml(const QString &text)
             auto element = std::make_unique<Node>();
             element->kind = NodeKind::Element;
             element->name = reader.name().toString();
+            element->line = qMax(1, static_cast<int>(reader.lineNumber()));
+            element->column = qMax(1, static_cast<int>(reader.columnNumber()));
             Node *raw = stack.back()->append(std::move(element));
             const auto attributes = reader.attributes();
             for (const QXmlStreamAttribute &attribute : attributes) {
@@ -704,6 +736,8 @@ Sheet parseXml(const QString &text)
                 attr->kind = NodeKind::Attribute;
                 attr->name = attribute.qualifiedName().toString();
                 attr->value = attribute.value().toString();
+                attr->line = raw->line;
+                attr->column = raw->column;
                 raw->append(std::move(attr));
             }
             stack.push_back(raw);
@@ -731,6 +765,8 @@ Sheet parseXml(const QString &text)
             textNode->kind = NodeKind::Characters;
             textNode->cdata = reader.isCDATA();
             textNode->value = reader.text().toString();
+            textNode->line = qMax(1, static_cast<int>(reader.lineNumber()));
+            textNode->column = qMax(1, static_cast<int>(reader.columnNumber()));
             parent->append(std::move(textNode));
             break;
         }
@@ -742,6 +778,8 @@ Sheet parseXml(const QString &text)
             auto comment = std::make_unique<Node>();
             comment->kind = NodeKind::Comment;
             comment->value = reader.text().toString();
+            comment->line = qMax(1, static_cast<int>(reader.lineNumber()));
+            comment->column = qMax(1, static_cast<int>(reader.columnNumber()));
             stack.back()->append(std::move(comment));
             break;
         }
@@ -755,6 +793,8 @@ Sheet parseXml(const QString &text)
             instruction->spelling = QStringLiteral("pi");
             instruction->name = reader.processingInstructionTarget().toString();
             instruction->value = reader.processingInstructionData().toString();
+            instruction->line = qMax(1, static_cast<int>(reader.lineNumber()));
+            instruction->column = qMax(1, static_cast<int>(reader.columnNumber()));
             stack.back()->append(std::move(instruction));
             break;
         }
@@ -877,6 +917,8 @@ Sheet parseIni(const QString &text)
     sheet.notation = Notation::Ini;
     auto root = std::make_unique<Node>();
     root->kind = NodeKind::Document;
+    root->line = 1;
+    root->column = 1;
     QStringList lines = text.split(QLatin1Char('\n'));
     if (text.endsWith(QLatin1Char('\n')) && !lines.isEmpty() && lines.last().isEmpty())
         lines.removeLast();
@@ -896,6 +938,8 @@ Sheet parseIni(const QString &text)
         if (trimmed.isEmpty()) {
             auto blank = std::make_unique<Node>();
             blank->kind = NodeKind::Blank;
+            blank->line = lineNo;
+            blank->column = 1;
             parent->append(std::move(blank));
             continue;
         }
@@ -904,6 +948,8 @@ Sheet parseIni(const QString &text)
             comment->kind = NodeKind::Comment;
             comment->spelling = trimmed.left(1);
             comment->value = trimmed;
+            comment->line = lineNo;
+            comment->column = 1;
             parent->append(std::move(comment));
             continue;
         }
@@ -916,6 +962,8 @@ Sheet parseIni(const QString &text)
             auto created = std::make_unique<Node>();
             created->kind = NodeKind::Section;
             created->name = name;
+            created->line = lineNo;
+            created->column = 1;
             section = root->append(std::move(created));
             continue;
         }
@@ -940,6 +988,8 @@ Sheet parseIni(const QString &text)
         field->name = key;
         field->value = val;
         field->quoted = quoted;
+        field->line = lineNo;
+        field->column = qMax(1, raw.indexOf(key) + 1);
         parent->append(std::move(field));
     }
 

@@ -341,6 +341,30 @@ Node *StructureModel::nodeFrom(const QModelIndex &index) const
     return static_cast<Node *>(index.internalPointer());
 }
 
+Node *StructureModel::nodeAt(const QModelIndex &index) const
+{
+    return nodeFrom(index);
+}
+
+QModelIndex StructureModel::indexForNode(Node *node) const
+{
+    return indexFor(node);
+}
+
+void StructureModel::transplantLines(const Sheet &parsed)
+{
+    const auto copy = [](auto &&self, Node *live, const Node *fresh) -> void {
+        if (live == nullptr || fresh == nullptr)
+            return;
+        live->line = fresh->line;
+        live->column = fresh->column;
+        const int count = qMin(live->childCount(), fresh->childCount());
+        for (int i = 0; i < count; ++i)
+            self(self, live->children[static_cast<size_t>(i)].get(), fresh->children[static_cast<size_t>(i)].get());
+    };
+    copy(copy, m_sheet.root.get(), parsed.root.get());
+}
+
 QModelIndex StructureModel::indexFor(Node *node) const
 {
     if (node == nullptr || !m_sheet.root)

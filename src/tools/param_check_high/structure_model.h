@@ -36,6 +36,9 @@ public:
     int rowCount(const QModelIndex &parent = QModelIndex()) const override;
     int columnCount(const QModelIndex &parent = QModelIndex()) const override;
     Qt::ItemFlags flags(const QModelIndex &index) const override;
+    Node *nodeAt(const QModelIndex &index) const;
+    QModelIndex indexForNode(Node *node) const;
+    void transplantLines(const Sheet &parsed);
 
 signals:
     void structureEdited();
