@@ -11,6 +11,7 @@
 #include <QFileInfo>
 #include <QFontDatabase>
 #include <QFrame>
+#include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QItemSelectionModel>
@@ -19,12 +20,18 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QPushButton>
+#include <QScrollBar>
 #include <QShortcut>
 #include <QSignalBlocker>
 #include <QSplitter>
+#include <QTextDocument>
+#include <QThread>
 #include <QTimer>
 #include <QTreeView>
 #include <QVBoxLayout>
+#include <QtConcurrent>
+
+#include <exception>
 
 namespace tw {
 namespace {
@@ -47,8 +54,40 @@ QPushButton *makeButton(const QString &text, const QString &accessibleName, cons
 }
 
 const ParamKind kScalarKinds[] = {ParamKind::String, ParamKind::Number, ParamKind::Bool, ParamKind::Null};
+constexpr int kLargeTextChars = 1024 * 1024;
+
+int asyncMinChars()
+{
+    bool ok = false;
+    const int value = qEnvironmentVariableIntValue("TW_PARAM_ASYNC_MIN_CHARS", &ok);
+    if (ok && value >= 0)
+        return value;
+    return 32 * 1024;
+}
+
+int asyncDelayMs()
+{
+    // 只给测试用来确认解析发生在界面线程之外。正常运行时是 0。
+    bool ok = false;
+    const int value = qEnvironmentVariableIntValue("TW_PARAM_ASYNC_DELAY_MS", &ok);
+    if (!ok || value <= 0)
+        return 0;
+    return qMin(value, 5000);
+}
+
+int editorCharCount(const QPlainTextEdit *editor)
+{
+    if (!editor || !editor->document())
+        return 0;
+    return qMax(0, editor->document()->characterCount() - 1);
+}
 
 } // namespace
+
+struct ParamAsyncParse {
+    ParamDocument document;
+    bool dropTreeOnFailure = false;
+};
 
 ParamEditorPage::ParamEditorPage(const ToolServices &services, QWidget *parent)
     : QWidget(parent)
@@ -63,11 +102,11 @@ ParamEditorPage::ParamEditorPage(const ToolServices &services, QWidget *parent)
 
     buildUi();
     if (!dirError.isEmpty())
-        setBanner(dirError, true);
+        setNotice(dirError, Notice::Error);
 
     m_parseTimer->setSingleShot(true);
     m_parseTimer->setInterval(200);
-    connect(m_parseTimer, &QTimer::timeout, this, &ParamEditorPage::applyParse);
+    connect(m_parseTimer, &QTimer::timeout, this, [this]() { beginParse(false, false); });
     connect(m_editor, &QPlainTextEdit::textChanged, this, &ParamEditorPage::onTextChanged);
     connect(m_model, &ParamTreeModel::documentEdited, this, &ParamEditorPage::onDocumentEdited);
     connect(m_model, &ParamTreeModel::editRejected, this, [this](const QString &reason) {
@@ -77,7 +116,8 @@ ParamEditorPage::ParamEditorPage(const ToolServices &services, QWidget *parent)
         if (m_applying)
             return;
         m_preferSuffix = false;
-        flushParse();
+        m_parseTimer->stop();
+        beginParse(false, false);
     });
     connect(m_type, qOverload<int>(&QComboBox::currentIndexChanged), this, &ParamEditorPage::onTypeChanged);
     connect(m_tree->selectionModel(), &QItemSelectionModel::currentChanged, this, [this](const QModelIndex &, const QModelIndex &) {
@@ -104,6 +144,12 @@ ParamEditorPage::ParamEditorPage(const ToolServices &services, QWidget *parent)
 
 ParamEditorPage::~ParamEditorPage()
 {
+    ++m_parseGeneration;
+    m_asyncRestart = false;
+    const auto watchers = findChildren<QObject *>(QStringLiteral("paramParseWatcher"));
+    for (QObject *watcher : watchers)
+        disconnect(watcher, nullptr, this, nullptr);
+    m_inflight.reset();
     persistSession();
 }
 
@@ -154,6 +200,8 @@ void ParamEditorPage::buildUi()
 
     m_banner = makeLabel(QString(), "hint", this);
     m_banner->setVisible(false);
+    m_banner->setAccessibleName(QStringLiteral("解析提示"));
+    m_banner->setTextInteractionFlags(Qt::TextSelectableByMouse);
     layout->addWidget(m_banner);
 
     m_editor = new QPlainTextEdit(this);
@@ -163,7 +211,7 @@ void ParamEditorPage::buildUi()
     m_editor->setPlaceholderText(
         QStringLiteral("在这里粘贴 JSON、XML 或 INI，或使用「打开」载入文件。解析失败时，这里的原文会保留。"));
     m_editor->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    m_editor->setMinimumWidth(80);
+    m_editor->setMinimumSize(160, 140);
 
     m_tree = new QTreeView(this);
     m_tree->setObjectName(QStringLiteral("paramTree"));
@@ -176,7 +224,8 @@ void ParamEditorPage::buildUi()
     m_tree->setEditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed
                             | QAbstractItemView::AnyKeyPressed);
     m_tree->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-    m_tree->setMinimumWidth(80);
+    m_tree->setMinimumSize(200, 140);
+    m_tree->header()->setMinimumSectionSize(72);
     m_tree->header()->setStretchLastSection(true);
     m_tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
     m_tree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
@@ -232,6 +281,7 @@ void ParamEditorPage::buildUi()
     rightLayout->addWidget(actionBar);
 
     m_splitter = new QSplitter(Qt::Horizontal, this);
+    m_splitter->setHandleWidth(8);
     m_splitter->setChildrenCollapsible(false);
     m_splitter->addWidget(leftCard);
     m_splitter->addWidget(rightCard);
@@ -240,7 +290,9 @@ void ParamEditorPage::buildUi()
     layout->addWidget(m_splitter, 1);
 
     layout->addWidget(makeLabel(
-        QStringLiteral("解析失败时保留左侧原文，并暂停右侧编辑，避免把上一次的结构写回去。YAML 暂不支持。"),
+        QStringLiteral("修改文本时如果解析失败，左侧原文会保留，右侧停在上次成功的结构上且不能编辑。"
+                       "打开另一个文件若解析失败，右侧会清空，避免和上一个文件混在一起。"
+                       "较大的文件在后台解析，完成前不会改文件。YAML 暂不支持。"),
         "hint", this));
 }
 
@@ -292,19 +344,26 @@ bool ParamEditorPage::openFile(const QString &path, QString *error)
     m_savedText = loaded.text;
     m_dirty = false;
     m_parsedOnce = true;
+    m_saveBlockedReason.clear();
 
     if (loaded.lossyUtf8) {
-        m_treeInSync = false;
-        m_model->setLocked(true);
-        setBanner(QStringLiteral("原文件不是合法的 UTF-8。左侧是替换后的预览，改正文本之前不会写回，以免损坏原始字节。右侧已暂停同步。"),
-                  true);
+        clearTree();
+        setNotice(QStringLiteral("原文件不是合法的 UTF-8。左侧是替换后的预览，改正文本之前不会写回，以免损坏原始字节。右侧不显示结构。"),
+                  Notice::Error);
         m_services.logError(QStringLiteral("打开了非 UTF-8 文件，未写回：") + m_path);
         updateChrome();
         persistSession();
         return true;
     }
 
-    applyParse();
+    beginParse(false, true);
+    persistSession();
+    if (m_asyncBusy) {
+        m_services.showStatus(StatusState::Busy, QStringLiteral("正在解析较大的文件，完成前不会改动文件。"));
+        m_services.logInfo(QStringLiteral("正在解析 ") + m_path);
+        updateChrome();
+        return true;
+    }
     if (!m_treeInSync) {
         const QString message = m_errorText.isEmpty() ? QStringLiteral("解析失败") : m_errorText;
         m_services.showStatus(StatusState::Error, message);
@@ -314,7 +373,6 @@ bool ParamEditorPage::openFile(const QString &path, QString *error)
         m_services.logInfo(QStringLiteral("已打开 ") + paramFormatName(m_activeFormat) + QStringLiteral(" 文件"));
     }
     updateChrome();
-    persistSession();
     Q_UNUSED(error);
     return true;
 }
@@ -335,13 +393,31 @@ bool ParamEditorPage::saveFile(QString *error)
         m_services.logError(message);
         return false;
     }
+    if (!m_saveBlockedReason.isEmpty()) {
+        const QString message = m_saveBlockedReason + QStringLiteral(" 文件没有改动。");
+        if (error)
+            *error = message;
+        m_services.showStatus(StatusState::Error, message);
+        return false;
+    }
     m_parseTimer->stop();
-    if (!m_dirty) {
+    const QString text = m_editor->toPlainText();
+    if (!textIsWellFormedUtf16(text)) {
+        const QString message = QStringLiteral("文本里有无法编码成 UTF-8 的字符，已取消写入，原文件未改动。");
+        if (error)
+            *error = message;
+        m_services.showStatus(StatusState::Error, message);
+        m_services.logError(message);
+        return false;
+    }
+    if (text == m_savedText) {
+        m_dirty = false;
         m_services.showStatus(StatusState::Info, QStringLiteral("没有需要保存的修改"));
+        updateChrome();
         return true;
     }
 
-    const QByteArray bytes = encodeParamText(m_editor->toPlainText(), m_utf8Bom, m_crlf);
+    const QByteArray bytes = encodeParamText(text, m_utf8Bom, m_crlf);
     QString writeError;
     if (!writeParamFileAtomically(m_path, bytes, &writeError)) {
         if (error)
@@ -350,7 +426,7 @@ bool ParamEditorPage::saveFile(QString *error)
         m_services.logError(writeError);
         return false;
     }
-    m_savedText = m_editor->toPlainText();
+    m_savedText = text;
     m_dirty = false;
     m_lossyUnedited = false;
     QString message = QStringLiteral("已保存");
@@ -370,12 +446,23 @@ bool ParamEditorPage::saveFileAs(const QString &path, QString *error)
             *error = QStringLiteral("保存路径是空的");
         return false;
     }
+    const QString previousPath = m_path;
+    const QString previousSuffix = m_suffix;
+    const QString previousDirectory = m_lastDirectory;
+    const bool previousDirty = m_dirty;
     const QFileInfo info(path);
     m_path = info.absoluteFilePath();
     m_suffix = info.suffix();
     m_lastDirectory = info.absolutePath();
     m_dirty = true;
-    return saveFile(error);
+    if (saveFile(error))
+        return true;
+    m_path = previousPath;
+    m_suffix = previousSuffix;
+    m_lastDirectory = previousDirectory;
+    m_dirty = previousDirty;
+    updateChrome();
+    return false;
 }
 
 void ParamEditorPage::editSourceText(const QString &text)
@@ -387,7 +474,8 @@ void ParamEditorPage::editSourceText(const QString &text)
 void ParamEditorPage::flushParse()
 {
     m_parseTimer->stop();
-    applyParse();
+    m_asyncRestart = false;
+    beginParse(true, false);
 }
 
 QString ParamEditorPage::sourceText() const
@@ -416,26 +504,103 @@ bool ParamEditorPage::setNodeText(const QStringList &path, const QString &value)
     return m_model->setData(index.sibling(index.row(), 2), value, Qt::EditRole);
 }
 
-void ParamEditorPage::applyParse()
+void ParamEditorPage::beginParse(bool forceSync, bool dropTreeOnFailure)
 {
+    const quint64 generation = ++m_parseGeneration;
     const QString text = m_editor->toPlainText();
     m_parsedOnce = true;
+    if (dropTreeOnFailure)
+        clearTree();
+
     if (text.trimmed().isEmpty()) {
         m_treeInSync = false;
         m_activeFormat = ParamFormat::Unsupported;
-        m_model->setLocked(true);
-        setBanner(QStringLiteral("内容是空的，没有可解析的参数。左侧原文已保留。"), true);
+        if (!dropTreeOnFailure)
+            m_model->setLocked(true);
+        const QString message = dropTreeOnFailure
+            ? QStringLiteral("文件是空的，没有可检查的参数。")
+            : QStringLiteral("内容是空的。左侧原文已保留，右侧暂时不能编辑。");
+        setNotice(message, Notice::Error);
         updateChrome();
         return;
     }
 
     const ParamFormat requested = requestedFormat();
     const QString suffix = (requested == ParamFormat::Auto && m_preferSuffix) ? m_suffix : QString();
+    const bool async = !forceSync && text.size() >= asyncMinChars();
+    if (async) {
+        if (m_asyncBusy) {
+            m_asyncRestart = true;
+            m_restartDropTree = dropTreeOnFailure;
+            return;
+        }
+        m_asyncBusy = true;
+        auto payload = std::make_shared<ParamAsyncParse>();
+        payload->dropTreeOnFailure = dropTreeOnFailure;
+        m_inflight = payload;
+        m_inflightGeneration = generation;
+        setNotice(QStringLiteral("正在解析较大的内容，可以继续编辑左侧。解析完成前不会改文件。"), Notice::Busy);
+        updateChrome();
+
+        auto *watcher = new QFutureWatcher<void>(this);
+        watcher->setObjectName(QStringLiteral("paramParseWatcher"));
+        connect(watcher, &QFutureWatcher<void>::finished, this, [this, watcher]() {
+            watcher->deleteLater();
+            onAsyncFinished();
+        });
+        const int delayMs = asyncDelayMs();
+        watcher->setFuture(QtConcurrent::run([payload, text, requested, suffix, delayMs]() {
+            if (delayMs > 0)
+                QThread::msleep(static_cast<unsigned long>(delayMs));
+            try {
+                payload->document = parseParamText(text, requested, suffix);
+            } catch (const std::exception &exception) {
+                payload->document.ok = false;
+                payload->document.format = requested;
+                payload->document.error = QStringLiteral("解析时发生内部错误，已停止。文件没有改动。（%1）")
+                                              .arg(QString::fromUtf8(exception.what()));
+            } catch (...) {
+                payload->document.ok = false;
+                payload->document.format = requested;
+                payload->document.error = QStringLiteral("解析时发生内部错误，已停止。文件没有改动。");
+            }
+        }));
+        return;
+    }
+
     ParamDocument document = parseParamText(text, requested, suffix);
-    if (!document.ok) {
+    if (generation != m_parseGeneration)
+        return;
+    acceptDocument(std::move(document), dropTreeOnFailure, false);
+}
+
+void ParamEditorPage::onAsyncFinished()
+{
+    m_asyncBusy = false;
+    const quint64 generation = m_inflightGeneration;
+    std::shared_ptr<ParamAsyncParse> payload = std::move(m_inflight);
+    const bool restart = m_asyncRestart;
+    const bool restartDrop = m_restartDropTree;
+    m_asyncRestart = false;
+    if (payload && generation == m_parseGeneration)
+        acceptDocument(std::move(payload->document), payload->dropTreeOnFailure, true);
+    if (restart)
+        beginParse(false, restartDrop);
+}
+
+void ParamEditorPage::acceptDocument(ParamDocument document, bool dropTreeOnFailure, bool fromAsync)
+{
+    if (!document.ok || !document.root) {
         m_treeInSync = false;
-        m_model->setLocked(true);
-        setBanner(document.error + QStringLiteral(" 左侧原文已保留，右侧暂停同步。"), true);
+        if (dropTreeOnFailure)
+            clearTree();
+        else
+            m_model->setLocked(true);
+        const QString detail = document.error.isEmpty() ? QStringLiteral("没有解析出结构。") : document.error;
+        const QString tail = dropTreeOnFailure
+            ? QStringLiteral(" 左侧是打开的原文，右侧已清空，避免和上一个文件混在一起。文件没有改动。")
+            : QStringLiteral(" 左侧原文已保留，右侧停在上次成功的结构上，并且不能编辑。文件没有改动。");
+        setNotice(detail + tail, Notice::Error);
         updateChrome();
         return;
     }
@@ -444,9 +609,39 @@ void ParamEditorPage::applyParse()
     m_model->setDocument(std::move(document));
     m_model->setLocked(false);
     m_treeInSync = true;
-    m_tree->expandToDepth(1);
-    setBanner({}, false);
+    const bool expanded = expandParsedTree();
+    if (!expanded) {
+        setNotice(QStringLiteral("项目较多，右侧没有自动展开。点名称左边的箭头可以逐层查看。"), Notice::Info);
+    } else if (fromAsync) {
+        setNotice(QString(), Notice::Clear);
+        m_services.showStatus(StatusState::Success, QStringLiteral("解析完成"));
+    } else {
+        setNotice(QString(), Notice::Clear);
+    }
     updateChrome();
+}
+
+void ParamEditorPage::clearTree()
+{
+    ParamDocument empty;
+    empty.format = ParamFormat::Unsupported;
+    empty.root = std::make_unique<ParamNode>();
+    empty.root->kind = ParamKind::Document;
+    m_model->setDocument(std::move(empty));
+    m_model->setLocked(true);
+    m_treeInSync = false;
+}
+
+bool ParamEditorPage::expandParsedTree()
+{
+    const int roots = m_model->rowCount();
+    if (roots > 120)
+        return false;
+    int nested = roots;
+    for (int row = 0; row < roots; ++row)
+        nested += m_model->rowCount(m_model->index(row, 0));
+    m_tree->expandToDepth(nested <= 400 ? 1 : 0);
+    return true;
 }
 
 void ParamEditorPage::onTextChanged()
@@ -455,10 +650,13 @@ void ParamEditorPage::onTextChanged()
         return;
     m_lossyUnedited = false;
     m_preferSuffix = false;
+    m_saveBlockedReason.clear();
     m_treeInSync = false;
     m_model->setLocked(true);
     recomputeDirty();
     updateChrome();
+    const bool large = editorCharCount(m_editor) >= asyncMinChars();
+    m_parseTimer->setInterval(large ? 400 : 200);
     m_parseTimer->start();
 }
 
@@ -467,17 +665,22 @@ void ParamEditorPage::onDocumentEdited()
     QString error;
     const QString text = serializeParam(m_model->document(), &error);
     if (!error.isEmpty()) {
-        setBanner(error, true);
-        m_services.showStatus(StatusState::Error, error);
+        m_saveBlockedReason = error;
+        setNotice(error + QStringLiteral(" 左侧文本还没改，文件也没有改动。"), Notice::Error);
         return;
     }
+    m_saveBlockedReason.clear();
+    QScrollBar *bar = m_editor->verticalScrollBar();
+    const int scroll = bar ? bar->value() : 0;
     m_applying = true;
     m_editor->setPlainText(text);
     m_applying = false;
+    if (bar)
+        bar->setValue(scroll);
     m_lossyUnedited = false;
     m_treeInSync = true;
     recomputeDirty();
-    setBanner({}, false);
+    setNotice(QString(), Notice::Clear);
     updateChrome();
 }
 
@@ -547,6 +750,8 @@ void ParamEditorPage::updateChrome()
 
     if (!m_parsedOnce)
         m_detected->setText(QStringLiteral("未识别"));
+    else if (m_asyncBusy && !m_treeInSync)
+        m_detected->setText(QStringLiteral("正在解析"));
     else if (!m_treeInSync)
         m_detected->setText(QStringLiteral("未同步"));
     else
@@ -584,20 +789,59 @@ void ParamEditorPage::updateChrome()
     m_type->setCurrentIndex(typeIndex);
 }
 
-void ParamEditorPage::setBanner(const QString &text, bool error)
+void ParamEditorPage::setNotice(const QString &text, Notice notice)
 {
-    m_errorText = text;
+    m_errorText = notice == Notice::Error ? text : QString();
     m_banner->setText(text);
     m_banner->setVisible(!text.isEmpty());
-    if (text.isEmpty())
-        m_services.clearStatus();
-    else if (error)
+    switch (notice) {
+    case Notice::Error:
         m_services.showStatus(StatusState::Error, text);
+        break;
+    case Notice::Busy:
+        m_services.showStatus(StatusState::Busy, text);
+        break;
+    case Notice::Info:
+        if (text.isEmpty())
+            m_services.clearStatus();
+        else
+            m_services.showStatus(StatusState::Info, text);
+        break;
+    case Notice::Clear:
+        m_services.clearStatus();
+        break;
+    }
 }
 
 void ParamEditorPage::recomputeDirty()
 {
+    // 超大文本每次按键都整篇拷贝会卡住界面。先标成未保存，真正保存时再比较一次。
+    if (editorCharCount(m_editor) > kLargeTextChars) {
+        m_dirty = true;
+        return;
+    }
     m_dirty = m_editor->toPlainText() != m_savedText;
+}
+
+bool ParamEditorPage::textIsWellFormedUtf16(const QString &text) const
+{
+    const ushort *units = text.utf16();
+    const int size = text.size();
+    for (int i = 0; i < size; ++i) {
+        const ushort unit = units[i];
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            if (i + 1 >= size)
+                return false;
+            const ushort low = units[i + 1];
+            if (low < 0xDC00 || low > 0xDFFF)
+                return false;
+            ++i;
+            continue;
+        }
+        if (unit >= 0xDC00 && unit <= 0xDFFF)
+            return false;
+    }
+    return true;
 }
 
 bool ParamEditorPage::confirmDiscard()

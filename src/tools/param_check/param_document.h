@@ -40,7 +40,10 @@ struct ParamNode {
     QString name;
     QString value;
     // JSON 数字的原始写法（例如 1.50、1e2）。用户改过值之后与 value 相同。
+    // INI 整行注释则用它记下分号或井号。
     QString literal;
+    // INI 键或节的行尾注释，含开头的 ; 或 #。值本身不再带这段文字。
+    QString inlineComment;
     bool cdata = false;
     bool quoted = false;
     ParamNode *parent = nullptr;

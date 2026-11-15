@@ -319,6 +319,8 @@ QVariant ParamTreeModel::data(const QModelIndex &index, int role) const
     const ParamNode *node = nodeAt(index);
     if (!node)
         return {};
+    if (role == Qt::ToolTipRole && !node->inlineComment.isEmpty())
+        return QStringLiteral("行尾注释：%1").arg(node->inlineComment);
     if (role == Qt::ToolTipRole && index.column() == 2)
         return paramNodeValueText(node);
     if (role != Qt::DisplayRole && role != Qt::EditRole)
@@ -355,7 +357,7 @@ bool ParamTreeModel::setData(const QModelIndex &index, const QVariant &value, in
             return false;
         }
         if ((node->kind == ParamKind::Element || node->kind == ParamKind::Attribute) && !xmlNameOk(name)) {
-            emit editRejected(QStringLiteral("名称不是合法的 XML 名称"));
+            emit editRejected(QStringLiteral("这个名称不能用于 XML。请用字母开头。"));
             return false;
         }
         if (node->kind == ParamKind::Section
@@ -407,7 +409,7 @@ bool ParamTreeModel::setData(const QModelIndex &index, const QVariant &value, in
         node->value = text;
     } else if (node->kind == ParamKind::Comment && m_doc.format == ParamFormat::Xml) {
         if (text.contains(QLatin1String("--"))) {
-            emit editRejected(QStringLiteral("XML 注释里不能包含连续的连字符"));
+            emit editRejected(QStringLiteral("注释里不能连续写两个减号（--），否则无法保存。"));
             return false;
         }
         node->value = text;

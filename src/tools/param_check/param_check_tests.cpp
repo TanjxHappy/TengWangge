@@ -1,5 +1,6 @@
 #include "core/data_paths.h"
 #include "core/platform_services.h"
+#include "shell/elided_label.h"
 #include "shell/tool_registry.h"
 #include "tools/param_check/param_check_tool.h"
 #include "tools/param_check/param_document.h"
@@ -12,6 +13,7 @@
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
+#include <QPlainTextEdit>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTextCodec>
@@ -69,6 +71,30 @@ public:
     ToolServices services;
 };
 
+class EnvGuard {
+public:
+    EnvGuard(const char *key, const char *value)
+        : m_key(key)
+        , m_old(qgetenv(key))
+        , m_had(qEnvironmentVariableIsSet(key))
+    {
+        qputenv(m_key.constData(), value);
+    }
+
+    ~EnvGuard()
+    {
+        if (m_had)
+            qputenv(m_key.constData(), m_old);
+        else
+            qunsetenv(m_key.constData());
+    }
+
+private:
+    QByteArray m_key;
+    QByteArray m_old;
+    bool m_had = false;
+};
+
 } // namespace
 
 class ParamCodecTests : public QObject
@@ -82,7 +108,9 @@ private slots:
     void xmlReportsInvalidSyntax();
     void iniParsesSectionsCommentsAndQuotedValues();
     void iniSectionIsNotParsedAsJsonArray();
+    void iniTrailingCommentIsNotPartOfTheValue();
     void yamlIsRejected();
+    void nestingAndSizeLimitsStopCleanly();
     void atomicWriteReplacesAndLeavesNoTemp();
 };
 
@@ -155,6 +183,12 @@ void ParamCodecTests::xmlReportsInvalidSyntax()
     QVERIFY(!document.ok);
     QVERIFY(document.error.contains(QStringLiteral("XML")));
     QVERIFY(document.error.contains(QStringLiteral("行")));
+    QVERIFY(!document.error.contains(QStringLiteral("unexpected")));
+    QVERIFY(!document.error.contains(QStringLiteral("Premature")));
+
+    const ParamDocument mismatch = parseParamText(QStringLiteral("<root></rot>"), ParamFormat::Xml);
+    QVERIFY(!mismatch.ok);
+    QVERIFY(mismatch.error.contains(QStringLiteral("标签")));
 }
 
 void ParamCodecTests::iniParsesSectionsCommentsAndQuotedValues()
@@ -192,11 +226,145 @@ void ParamCodecTests::iniSectionIsNotParsedAsJsonArray()
     QCOMPARE(json.root->kind, ParamKind::Array);
 }
 
+void ParamCodecTests::iniTrailingCommentIsNotPartOfTheValue()
+{
+    const QString source = QStringLiteral(
+        "[server] ; 主配置\n"
+        "port=8080 ; 监听\n"
+        "name=\"a;b\" # 说明\n"
+        "path=C:\\a;b\n"
+        "color=#fff\n");
+    ParamDocument document = parseParamText(source, ParamFormat::Ini);
+    QVERIFY2(document.ok, qPrintable(document.error));
+    QCOMPARE(document.root->children[0]->name, QStringLiteral("server"));
+    QCOMPARE(document.root->children[0]->inlineComment, QStringLiteral("; 主配置"));
+    QCOMPARE(document.root->children[0]->children[0]->name, QStringLiteral("port"));
+    QCOMPARE(document.root->children[0]->children[0]->value, QStringLiteral("8080"));
+    QCOMPARE(document.root->children[0]->children[0]->inlineComment, QStringLiteral("; 监听"));
+    QCOMPARE(document.root->children[0]->children[1]->value, QStringLiteral("a;b"));
+    QCOMPARE(document.root->children[0]->children[1]->inlineComment, QStringLiteral("# 说明"));
+    QCOMPARE(document.root->children[0]->children[2]->value, QStringLiteral("C:\\a;b"));
+    QVERIFY(document.root->children[0]->children[2]->inlineComment.isEmpty());
+    QCOMPARE(document.root->children[0]->children[3]->value, QStringLiteral("#fff"));
+
+    document.root->children[0]->children[0]->value = QStringLiteral("9090");
+    const QString serialized = serializeParam(document);
+    QVERIFY(serialized.contains(QStringLiteral("[server] ; 主配置")));
+    QVERIFY(serialized.contains(QStringLiteral("port=9090 ; 监听")));
+    QVERIFY(serialized.contains(QStringLiteral("name=\"a;b\" # 说明")));
+    QVERIFY(!serialized.contains(QStringLiteral("8080 ;")));
+
+    const ParamDocument again = parseParamText(serialized, ParamFormat::Ini);
+    QVERIFY2(again.ok, qPrintable(again.error));
+    QCOMPARE(again.root->children[0]->children[0]->value, QStringLiteral("9090"));
+    QCOMPARE(again.root->children[0]->children[2]->value, QStringLiteral("C:\\a;b"));
+    QCOMPARE(again.root->children[0]->children[3]->value, QStringLiteral("#fff"));
+
+    const ParamDocument unclosed = parseParamText(QStringLiteral("name=\"abc\n"), ParamFormat::Ini);
+    QVERIFY(!unclosed.ok);
+    QVERIFY(unclosed.error.contains(QStringLiteral("引号")));
+    QVERIFY(unclosed.error.contains(QStringLiteral("第 1 行")));
+}
+
 void ParamCodecTests::yamlIsRejected()
 {
     const ParamDocument document = parseParamText(QStringLiteral("name: value\n"), ParamFormat::Auto, QStringLiteral("yml"));
     QVERIFY(!document.ok);
     QVERIFY(document.error.contains(QStringLiteral("YAML")));
+}
+
+void ParamCodecTests::nestingAndSizeLimitsStopCleanly()
+{
+    QString deepJson;
+    for (int i = 0; i < 200; ++i)
+        deepJson += QStringLiteral("{\"a\":");
+    deepJson += QLatin1Char('1');
+    for (int i = 0; i < 200; ++i)
+        deepJson += QLatin1Char('}');
+    const ParamDocument deep = parseParamText(deepJson, ParamFormat::Json);
+    QVERIFY(!deep.ok);
+    QVERIFY(deep.error.contains(QStringLiteral("嵌套")));
+    QVERIFY(deep.error.contains(QStringLiteral("行")));
+
+    QString shallowJson;
+    for (int i = 0; i < 20; ++i)
+        shallowJson += QStringLiteral("{\"a\":");
+    shallowJson += QLatin1Char('1');
+    for (int i = 0; i < 20; ++i)
+        shallowJson += QLatin1Char('}');
+    const ParamDocument shallow = parseParamText(shallowJson, ParamFormat::Json);
+    QVERIFY2(shallow.ok, qPrintable(shallow.error));
+
+    QString deepXml;
+    for (int i = 0; i < 200; ++i)
+        deepXml += QStringLiteral("<a>");
+    deepXml += QLatin1Char('x');
+    for (int i = 0; i < 200; ++i)
+        deepXml += QStringLiteral("</a>");
+    const ParamDocument deepXmlDocument = parseParamText(deepXml, ParamFormat::Xml);
+    QVERIFY(!deepXmlDocument.ok);
+    QVERIFY(deepXmlDocument.error.contains(QStringLiteral("嵌套")));
+    QVERIFY(deepXmlDocument.error.contains(QStringLiteral("XML")));
+
+    QString siblings = QStringLiteral("<root>");
+    for (int i = 0; i < 200; ++i)
+        siblings += QStringLiteral("<a/>");
+    siblings += QStringLiteral("</root>");
+    const ParamDocument flat = parseParamText(siblings, ParamFormat::Xml);
+    QVERIFY2(flat.ok, qPrintable(flat.error));
+    QCOMPARE(flat.root->children[0]->childCount(), 200);
+
+    QString commented = QStringLiteral("<root><!-- ");
+    for (int i = 0; i < 200; ++i)
+        commented += QStringLiteral("<a>");
+    commented += QStringLiteral(" --><name>甲</name></root>");
+    const ParamDocument commentedDocument = parseParamText(commented, ParamFormat::Xml);
+    QVERIFY2(commentedDocument.ok, qPrintable(commentedDocument.error));
+
+    const ParamDocument quoted = parseParamText(QStringLiteral("<root name=\"a>b\">甲</root>"), ParamFormat::Xml);
+    QVERIFY2(quoted.ok, qPrintable(quoted.error));
+    QCOMPARE(quoted.root->children[0]->children[0]->value, QStringLiteral("a>b"));
+
+    QString emoji = QStringLiteral("{\"e\":\"\\uD83D\\uDE00\"}");
+    const ParamDocument emojiDocument = parseParamText(emoji, ParamFormat::Json);
+    QVERIFY2(emojiDocument.ok, qPrintable(emojiDocument.error));
+    QCOMPARE(emojiDocument.root->children[0]->value, QString::fromUtf8("\xF0\x9F\x98\x80"));
+    const ParamDocument emojiAgain = parseParamText(serializeParam(emojiDocument), ParamFormat::Json);
+    QVERIFY(emojiAgain.ok);
+    QCOMPARE(emojiAgain.root->children[0]->value, emojiDocument.root->children[0]->value);
+
+    QString broken = QStringLiteral("{\"a\":\"");
+    broken += QChar(0xD800);
+    broken += QStringLiteral("\"}");
+    const ParamDocument surrogate = parseParamText(broken, ParamFormat::Json);
+    QVERIFY(!surrogate.ok);
+    QVERIFY(surrogate.error.contains(QStringLiteral("特殊字符")));
+
+    {
+        EnvGuard nodes("TW_PARAM_MAX_NODES", "8");
+        const ParamDocument tooMany = parseParamText(QStringLiteral("[1,2,3,4,5,6,7,8,9]"), ParamFormat::Json);
+        QVERIFY(!tooMany.ok);
+        QVERIFY(tooMany.error.contains(QStringLiteral("太多")));
+        QVERIFY(tooMany.error.contains(QStringLiteral("行")));
+    }
+    {
+        EnvGuard chars("TW_PARAM_MAX_CHARS", "12");
+        const ParamDocument tooLong = parseParamText(QStringLiteral("{\"name\":\"abcd\"}"), ParamFormat::Json);
+        QVERIFY(!tooLong.ok);
+        QVERIFY(tooLong.error.contains(QStringLiteral("字符")));
+    }
+
+    QString wide = QStringLiteral("[");
+    for (int i = 0; i < 3000; ++i) {
+        if (i)
+            wide += QLatin1Char(',');
+        wide += QString::number(i);
+    }
+    wide += QLatin1Char(']');
+    const ParamDocument wideDocument = parseParamText(wide, ParamFormat::Json);
+    QVERIFY2(wideDocument.ok, qPrintable(wideDocument.error));
+    QCOMPARE(wideDocument.root->childCount(), 3000);
+    QCOMPARE(wideDocument.root->children.back()->literal, QStringLiteral("2999"));
 }
 
 void ParamCodecTests::atomicWriteReplacesAndLeavesNoTemp()
@@ -235,6 +403,11 @@ private slots:
     void utf8BomAndCrlfArePreserved();
     void invalidUtf8IsNotWrittenBack();
     void failedOpenDoesNotDiscardEditorText();
+    void openingBrokenFileClearsThePreviousTree();
+    void saveAsFailureKeepsTheOriginalFile();
+    void iniTreeEditKeepsTrailingComment();
+    void largeParseDoesNotBlockTheUi();
+    void loneSurrogateIsNotWrittenBack();
     void sessionStaysInsideDataDir();
 };
 
@@ -448,6 +621,109 @@ void ParamEditorTests::failedOpenDoesNotDiscardEditorText()
     QVERIFY(!error.isEmpty());
     QCOMPARE(page.sourceText(), before);
     QVERIFY(page.treeInSync());
+}
+
+void ParamEditorTests::openingBrokenFileClearsThePreviousTree()
+{
+    ServiceFixture fixture;
+    ParamEditorPage page(fixture.services);
+    page.editSourceText(QStringLiteral("{\"keep\":1}"));
+    QVERIFY(page.hasNode({QStringLiteral("keep")}));
+
+    const QString path = fixture.dir.filePath(QStringLiteral("broken.json"));
+    const QByteArray broken = QByteArray("{\"a\":");
+    QVERIFY(writeBytes(path, broken));
+    QString error;
+    QVERIFY2(page.openFile(path, &error), qPrintable(error));
+    QCOMPARE(page.sourceText(), QStringLiteral("{\"a\":"));
+    QVERIFY(!page.treeInSync());
+    QVERIFY(page.parseError().contains(QStringLiteral("行")));
+    QVERIFY(page.parseError().contains(QStringLiteral("原文")));
+    QVERIFY(!page.hasNode({QStringLiteral("keep")}));
+    QVERIFY(!page.hasNode({QStringLiteral("a")}));
+    QCOMPARE(readBytes(path), broken);
+}
+
+void ParamEditorTests::saveAsFailureKeepsTheOriginalFile()
+{
+    ServiceFixture fixture;
+    const QString path = fixture.dir.filePath(QStringLiteral("cfg.json"));
+    const QByteArray original = QByteArray("{\"a\":1}\n");
+    QVERIFY(writeBytes(path, original));
+
+    ParamEditorPage page(fixture.services);
+    QString error;
+    QVERIFY2(page.openFile(path, &error), qPrintable(error));
+    QVERIFY(page.setNodeText({QStringLiteral("a")}, QStringLiteral("2")));
+    QVERIFY(!page.saveFileAs(fixture.dir.filePath(QStringLiteral("missing/out.json")), &error));
+    QVERIFY(error.contains(QStringLiteral("目录")));
+    QCOMPARE(readBytes(path), original);
+    QVERIFY(!QFileInfo::exists(fixture.dir.filePath(QStringLiteral("missing/out.json"))));
+
+    auto *label = page.findChild<ElidedLabel *>();
+    QVERIFY(label != nullptr);
+    QVERIFY(label->fullText().contains(QStringLiteral("cfg.json")));
+    QVERIFY(!label->fullText().contains(QStringLiteral("missing")));
+}
+
+void ParamEditorTests::iniTreeEditKeepsTrailingComment()
+{
+    ServiceFixture fixture;
+    ParamEditorPage page(fixture.services);
+    page.editSourceText(QStringLiteral("[server] ; 主配置\nport=8080 ; 监听\n"));
+    QVERIFY2(page.parseError().isEmpty(), qPrintable(page.parseError()));
+    QCOMPARE(page.nodeText({QStringLiteral("server"), QStringLiteral("port")}), QStringLiteral("8080"));
+    QVERIFY(page.setNodeText({QStringLiteral("server"), QStringLiteral("port")}, QStringLiteral("9090")));
+    QVERIFY(page.sourceText().contains(QStringLiteral("port=9090")));
+    QVERIFY(page.sourceText().contains(QStringLiteral("监听")));
+    QVERIFY(page.sourceText().contains(QStringLiteral("主配置")));
+    QVERIFY(!page.sourceText().contains(QStringLiteral("8080 ;")));
+}
+
+void ParamEditorTests::largeParseDoesNotBlockTheUi()
+{
+    EnvGuard chars("TW_PARAM_ASYNC_MIN_CHARS", "8");
+    EnvGuard delay("TW_PARAM_ASYNC_DELAY_MS", "600");
+    ServiceFixture fixture;
+    ParamEditorPage page(fixture.services);
+    auto *editor = page.findChild<QPlainTextEdit *>(QStringLiteral("paramSource"));
+    QVERIFY(editor != nullptr);
+    editor->setPlainText(QStringLiteral("{\"a\":1,\"b\":2}"));
+    QTest::qWait(650);
+    QVERIFY(!page.treeInSync());
+    QCOMPARE(page.sourceText(), QStringLiteral("{\"a\":1,\"b\":2}"));
+    QTRY_VERIFY_WITH_TIMEOUT(page.treeInSync(), 3000);
+    QVERIFY2(page.parseError().isEmpty(), qPrintable(page.parseError()));
+    QCOMPARE(page.nodeText({QStringLiteral("a")}), QStringLiteral("1"));
+    QCOMPARE(page.nodeText({QStringLiteral("b")}), QStringLiteral("2"));
+    QCOMPARE(page.activeFormat(), ParamFormat::Json);
+
+    editor->setPlainText(QStringLiteral("<root id=\"1\">甲</root>"));
+    QTest::qWait(650);
+    QVERIFY(!page.treeInSync());
+    QTRY_VERIFY_WITH_TIMEOUT(page.treeInSync(), 3000);
+    QCOMPARE(page.activeFormat(), ParamFormat::Xml);
+    QCOMPARE(page.nodeText({QStringLiteral("root"), QStringLiteral("@id")}), QStringLiteral("1"));
+    QCOMPARE(page.nodeText({QStringLiteral("root")}), QStringLiteral("甲"));
+}
+
+void ParamEditorTests::loneSurrogateIsNotWrittenBack()
+{
+    ServiceFixture fixture;
+    const QString path = fixture.dir.filePath(QStringLiteral("note.json"));
+    const QByteArray original = QByteArray("{\"a\":1}\n");
+    QVERIFY(writeBytes(path, original));
+
+    ParamEditorPage page(fixture.services);
+    QString error;
+    QVERIFY2(page.openFile(path, &error), qPrintable(error));
+    QString text = QStringLiteral("{\"a\":\"");
+    text += QChar(0xD800);
+    text += QStringLiteral("\"}");
+    page.editSourceText(text);
+    QVERIFY(!page.saveFile(&error));
+    QVERIFY(error.contains(QStringLiteral("字符")));
+    QCOMPARE(readBytes(path), original);
 }
 
 void ParamEditorTests::sessionStaysInsideDataDir()

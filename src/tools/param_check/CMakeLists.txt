@@ -11,8 +11,8 @@ tw_add_tool(param_check SOURCES
     param_io.h
 )
 
-find_package(Qt5 5.15 REQUIRED COMPONENTS Xml)
-target_link_libraries(tw_tool_param_check PRIVATE Qt5::Xml)
+find_package(Qt5 5.15 REQUIRED COMPONENTS Xml Concurrent)
+target_link_libraries(tw_tool_param_check PRIVATE Qt5::Xml Qt5::Concurrent)
 
 if(TENGWANGGE_BUILD_TESTS)
     enable_testing()

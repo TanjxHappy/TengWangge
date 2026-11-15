@@ -5,6 +5,8 @@
 
 #include <QWidget>
 
+#include <memory>
+
 class QComboBox;
 class QLabel;
 class QPlainTextEdit;
@@ -18,6 +20,7 @@ namespace tw {
 
 class ElidedLabel;
 class ParamTreeModel;
+struct ParamAsyncParse;
 
 // 左右两栏：左侧是源文本，右侧是可编辑的结构树。只有用户保存时才写文件。
 class ParamEditorPage : public QWidget
@@ -49,7 +52,11 @@ protected:
 
 private:
     void buildUi();
-    void applyParse();
+    void beginParse(bool forceSync, bool dropTreeOnFailure);
+    void acceptDocument(ParamDocument document, bool dropTreeOnFailure, bool fromAsync);
+    void onAsyncFinished();
+    void clearTree();
+    bool expandParsedTree();
     void onTextChanged();
     void onDocumentEdited();
     void onOpen();
@@ -59,8 +66,10 @@ private:
     void onRemove();
     void onTypeChanged(int index);
     void updateChrome();
-    void setBanner(const QString &text, bool error);
+    enum class Notice { Clear, Info, Busy, Error };
+    void setNotice(const QString &text, Notice notice);
     void recomputeDirty();
+    bool textIsWellFormedUtf16(const QString &text) const;
     bool confirmDiscard();
     bool saveAsInteractive(QString *error);
     ParamFormat requestedFormat() const;
@@ -83,6 +92,13 @@ private:
     bool m_crlf = false;
     bool m_parsedOnce = false;
     bool m_splitterRestored = false;
+    bool m_asyncBusy = false;
+    bool m_asyncRestart = false;
+    bool m_restartDropTree = false;
+    quint64 m_parseGeneration = 0;
+    quint64 m_inflightGeneration = 0;
+    QString m_saveBlockedReason;
+    std::shared_ptr<ParamAsyncParse> m_inflight;
 
     ParamTreeModel *m_model = nullptr;
     QPlainTextEdit *m_editor = nullptr;
