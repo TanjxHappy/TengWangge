@@ -132,10 +132,19 @@ TENGWANGGE_SCREENSHOT_DIR=/tmp/tw-shots QT_QPA_PLATFORM=offscreen ./build/tests/
 
 ## 验证状态
 
-本仓库在下列环境验证过（全部 `-DTENGWANGGE_WARNINGS_AS_ERRORS=ON`，三类测试全部通过）：
-Ubuntu 24.04 + Qt 5.15.13，分别用 g++ 10、g++ 13、clang++ 18；CMake 3.22.6 与 3.28。
-**尚未在真实的麒麟 KylinSec 3.5（GCC 10.3 / Qt 5.15.2）机器上跑过。** 代码只使用 Qt 5.15.0
-即有的 API，所以预期可直接编译；如果在麒麟上遇到问题，请把编译输出反馈回来。
+三类测试（`core_tests`、`core_layering`、`ui_tests`）在下列环境全部通过：
+
+| 环境 | 编译器 / CMake / Qt | 结果 |
+| --- | --- | --- |
+| 麒麟 KylinSec OS 3，x86_64 | GCC 10.3.1，CMake 3.22.0，Qt 5.15.2 | 默认选项 Release 编译，0 警告；3/3 测试通过 |
+| Ubuntu 24.04 | g++ 10 / g++ 13 / clang++ 18，CMake 3.22.6 与 3.28，Qt 5.15.13 | `-DTENGWANGGE_WARNINGS_AS_ERRORS=ON` 编译通过；3/3 测试通过 |
+
+麒麟上的验证针对提交 `7a9d11b`（2026-11-15）：
+
+- 中文字体命中 Noto Sans CJK SC，界面中文显示正常，没有缺字。
+- offscreen 启动并截图正常；在登录用户自己的 X 桌面上启动并截图正常。
+- 通过 SSH 启动时，只能连到当前用户自己的桌面；别的用户的显示会因 X 授权被拒绝
+  （`No protocol specified`），这是系统权限，不是程序问题。
 
 ## 许可与素材
 
