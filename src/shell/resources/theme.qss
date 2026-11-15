@@ -1,0 +1,172 @@
+/* TengWangge workbench theme.
+ * Colour and font placeholders (name between two at-signs) are replaced from tw::Theme at load time.
+ * Chrome (top bar, tool rail, status bar) is dark graphite; the work area is light.
+ * Tool pages style themselves through the `role` property documented in
+ * docs/ADDING_A_TOOL.md instead of private object names.
+ */
+
+QMainWindow { background: @surface@; }
+QWidget {
+    font-family: @fontFamily@;
+    font-size: @fontSize@px;
+    color: @text@;
+}
+QToolTip {
+    background: @chrome@; color: @chromeText@;
+    border: 1px solid @chromeBorder@; padding: 4px 8px;
+}
+
+/* ---------- top bar ---------- */
+QFrame#topBar {
+    background: @chrome@;
+    border: none; border-bottom: 1px solid @chromeBorder@;
+}
+QFrame#topBar QLabel { background: transparent; }
+QFrame#topBar QLabel#brandMark {
+    background: @accent@; color: @chrome@;
+    border-radius: 2px; font-size: 15px; font-weight: 800;
+}
+QLabel#brandName { color: @chromeText@; font-size: 16px; font-weight: 700; }
+QLabel#brandSub { color: @chromeMuted@; font-size: 11px; }
+QLabel#breadcrumbTool { color: @chromeText@; font-weight: 600; }
+QLabel#breadcrumbSep { color: @chromeDisabled@; }
+QLabel#breadcrumbPage { color: @chromeMuted@; }
+QLabel#topVersion { color: @chromeMuted@; font-size: 11px; }
+QFrame#topSeparator, QFrame#statusSeparator { background: @chromeBorder@; border: none; }
+
+/* ---------- tool rail (items are painted by ToolRailDelegate) ---------- */
+QWidget#railPanel {
+    background: @chromeRaised@;
+    border: none; border-right: 1px solid @chromeBorder@;
+}
+QLabel#railHeader {
+    color: @chromeMuted@; font-size: 11px; font-weight: 600;
+    background: transparent; padding: 10px 14px 6px 14px;
+}
+QListWidget#toolRail { background: transparent; border: none; outline: none; }
+QListWidget#toolRail:disabled { background: transparent; }
+
+/* ---------- tool view: page strip + page stack ---------- */
+QWidget#toolView, QStackedWidget#toolStack { background: @surface@; }
+QFrame#pageStrip {
+    background: @panelAlt@;
+    border: none; border-bottom: 1px solid @border@;
+}
+QTabBar#pageTabs { background: transparent; border: none; }
+QTabBar#pageTabs::tab {
+    background: transparent; color: @textMuted@;
+    border: none; border-bottom: 2px solid transparent;
+    padding: 8px 16px 6px 12px; margin: 0 2px 0 0; min-width: 40px;
+}
+QTabBar#pageTabs::tab:hover:!selected { color: @text@; background: @border@; }
+QTabBar#pageTabs::tab:selected {
+    color: @text@; font-weight: 600; background: @panel@;
+    border-bottom: 2px solid @accent@;
+}
+QTabBar#pageTabs[tabFocus="true"]::tab:selected {
+    background: #fff4d9; border-bottom: 3px solid @accent@;
+}
+QTabBar#pageTabs::tab:disabled { color: @disabledText@; background: transparent; }
+QTabBar#pageTabs::tab:selected:disabled {
+    color: @textMuted@; background: @panel@; border-bottom: 2px solid @disabledText@;
+}
+QTabBar#pageTabs QToolButton { background: @panelAlt@; border: none; }
+
+/* ---------- unavailable / empty ---------- */
+QWidget#unavailableView, QWidget#emptyView { background: @surface@; }
+QLabel#unavailableTitle { color: @danger@; font-size: 18px; font-weight: 700; }
+QLabel#unavailableReason { color: @textMuted@; }
+QLabel#emptyTitle { color: @textMuted@; font-size: 16px; font-weight: 600; }
+
+/* ---------- status bar ---------- */
+QStatusBar {
+    background: @chrome@; color: @chromeText@;
+    border: none; border-top: 1px solid @chromeBorder@;
+}
+QStatusBar::item { border: none; }
+QFrame#statusStrip { background: transparent; }
+QFrame#statusStrip QLabel { background: transparent; }
+QLabel#statusDot { border-radius: 4px; background: @statusIdle@; }
+QLabel#statusDot[state="idle"] { background: @statusIdle@; }
+QLabel#statusDot[state="info"] { background: @statusInfo@; }
+QLabel#statusDot[state="busy"] { background: @statusBusy@; }
+QLabel#statusDot[state="success"] { background: @statusSuccess@; }
+QLabel#statusDot[state="error"] { background: @statusError@; }
+QLabel#statusText { color: @statusIdle@; }
+QLabel#statusText[state="idle"] { color: @statusIdle@; }
+QLabel#statusText[state="info"] { color: @statusInfo@; }
+QLabel#statusText[state="busy"] { color: @statusBusy@; }
+QLabel#statusText[state="success"] { color: @statusSuccess@; }
+QLabel#statusText[state="error"] { color: @statusError@; font-weight: 700; }
+QFrame#statusStrip QLabel#statusLockChip {
+    background: @accent@; color: @chrome@;
+    border-radius: 2px; padding: 0 8px; font-weight: 600;
+}
+QPushButton#logToggle {
+    background: transparent; color: @chromeMuted@;
+    border: 1px solid transparent; border-radius: 2px; padding: 1px 10px;
+}
+QPushButton#logToggle:hover { background: @chromeHover@; color: @chromeText@; }
+QPushButton#logToggle:checked { color: @accent@; border-color: @chromeSelected@; }
+QPushButton#logToggle:focus { border-color: @accent@; }
+
+/* ---------- log panel ---------- */
+QFrame#logPanel { background: @panel@; border: none; border-top: 1px solid @border@; }
+QFrame#logHeader { background: @panelAlt@; border: none; border-bottom: 1px solid @border@; }
+QLabel#logTitle { font-weight: 600; background: transparent; }
+QPlainTextEdit#logView {
+    background: @panel@; border: none;
+    font-family: @monoFamily@; font-size: 12px;
+}
+QCheckBox#logShowAll { background: transparent; }
+
+/* ---------- shared controls for tool pages ---------- */
+QLabel[role="pageTitle"] { font-size: 18px; font-weight: 700; color: @text@; }
+QLabel[role="pageSubtitle"] { color: @textMuted@; }
+QLabel[role="sectionTitle"] { font-size: 14px; font-weight: 700; }
+QLabel[role="fieldLabel"] { color: @textMuted@; font-weight: 600; }
+QLabel[role="hint"] { color: @textMuted@; font-size: 12px; }
+QLabel[role="value"] { font-family: @monoFamily@; }
+QFrame[role="card"] {
+    background: @panel@; border: 1px solid @border@; border-radius: 2px;
+}
+QFrame[role="card"] QLabel { background: transparent; }
+
+QPushButton {
+    background: @panel@; color: @text@;
+    border: 1px solid @border@; border-radius: 2px; padding: 5px 16px; min-height: 18px;
+}
+QPushButton:hover { background: @panelAlt@; border-color: @textMuted@; }
+QPushButton:pressed { background: @border@; }
+QPushButton:focus { border: 1px solid @primary@; }
+QPushButton:disabled { color: @disabledText@; background: @panelAlt@; border-color: @border@; }
+QPushButton[role="primary"] { background: @primary@; color: #ffffff; border-color: @primary@; font-weight: 600; }
+QPushButton[role="primary"]:hover { background: @primaryHover@; border-color: @primaryHover@; }
+QPushButton[role="primary"]:disabled { background: @disabledText@; border-color: @disabledText@; color: #ffffff; }
+QPushButton[role="danger"] { color: @danger@; border-color: @danger@; }
+QPushButton[role="danger"]:hover { background: #fbe9e7; }
+
+QLineEdit, QSpinBox, QComboBox, QPlainTextEdit, QTextEdit {
+    background: @panel@; border: 1px solid @border@; border-radius: 2px;
+    padding: 3px 6px; selection-background-color: @primary@; selection-color: #ffffff;
+}
+QLineEdit:focus, QSpinBox:focus, QComboBox:focus, QPlainTextEdit:focus { border: 1px solid @primary@; }
+QLineEdit:disabled, QSpinBox:disabled { color: @disabledText@; background: @panelAlt@; }
+QCheckBox { spacing: 8px; }
+QCheckBox:disabled { color: @disabledText@; }
+QProgressBar {
+    border: 1px solid @border@; border-radius: 2px; background: @panelAlt@;
+    text-align: center; min-height: 14px; max-height: 14px;
+}
+QProgressBar::chunk { background: @primary@; }
+
+QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: @border@; min-height: 28px; border-radius: 3px; margin: 1px; }
+QScrollBar::handle:vertical:hover { background: @disabledText@; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 0; }
+QScrollBar::handle:horizontal { background: @border@; min-width: 28px; border-radius: 3px; margin: 1px; }
+QScrollBar::handle:horizontal:hover { background: @disabledText@; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+QDialog, QMessageBox { background: @surface@; }

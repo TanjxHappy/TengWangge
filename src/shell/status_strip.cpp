@@ -1,0 +1,104 @@
+#include "shell/status_strip.h"
+
+#include "shell/elided_label.h"
+
+#include <QHBoxLayout>
+#include <QPushButton>
+#include <QStyle>
+#include <QVariant>
+
+namespace tw {
+namespace {
+
+void repolish(QWidget *w)
+{
+    w->style()->unpolish(w);
+    w->style()->polish(w);
+    w->update();
+}
+
+} // namespace
+
+StatusStrip::StatusStrip(QWidget *parent)
+    : QFrame(parent)
+{
+    setObjectName(QStringLiteral("statusStrip"));
+    setAccessibleName(QStringLiteral("状态栏"));
+
+    auto *layout = new QHBoxLayout(this);
+    layout->setContentsMargins(8, 0, 4, 0);
+    layout->setSpacing(8);
+
+    m_dot = new QLabel;
+    m_dot->setObjectName(QStringLiteral("statusDot"));
+    m_dot->setFixedSize(8, 8);
+
+    m_text = new ElidedLabel;
+    m_text->setObjectName(QStringLiteral("statusText"));
+    m_text->setAccessibleName(QStringLiteral("当前状态"));
+
+    m_lock = new QLabel;
+    m_lock->setObjectName(QStringLiteral("statusLockChip"));
+    m_lock->setAccessibleName(QStringLiteral("导航锁定"));
+    m_lock->hide();
+
+    m_logToggle = new QPushButton(QStringLiteral("日志"));
+    m_logToggle->setObjectName(QStringLiteral("logToggle"));
+    m_logToggle->setCheckable(true);
+    m_logToggle->setFocusPolicy(Qt::StrongFocus);
+    m_logToggle->setToolTip(QStringLiteral("显示/隐藏日志面板 (Ctrl+L)"));
+    m_logToggle->setAccessibleName(QStringLiteral("日志开关"));
+
+    layout->addWidget(m_dot, 0, Qt::AlignVCenter);
+    layout->addWidget(m_text, 1);
+    layout->addWidget(m_lock, 0, Qt::AlignVCenter);
+    layout->addWidget(m_logToggle, 0, Qt::AlignVCenter);
+
+    setStatus(StatusMessage{StatusState::Idle, StatusBoard::idleText()});
+}
+
+void StatusStrip::setStatus(const StatusMessage &message)
+{
+    m_status = message;
+    const QString state = StatusBoard::stateName(message.state);
+    const bool changed = m_dot->property("state").toString() != state;
+    m_dot->setProperty("state", state);
+    m_text->setProperty("state", state);
+    m_text->setFullText(message.text);
+    if (changed) {
+        repolish(m_dot);
+        repolish(m_text);
+    }
+}
+
+void StatusStrip::setLocked(bool locked, const QString &reason)
+{
+    m_lock->setVisible(locked);
+    if (locked) {
+        const QString shortReason = reason.size() > 30 ? reason.left(30) + QChar(0x2026) : reason;
+        const QString text = shortReason.isEmpty()
+            ? QStringLiteral("导航已锁定")
+            : QStringLiteral("导航已锁定：%1").arg(shortReason);
+        m_lock->setText(text);
+        m_lock->setToolTip(QStringLiteral("长时间任务进行中，任务结束前不能切换工具或页面。%1").arg(reason));
+    } else {
+        m_lock->clear();
+    }
+}
+
+QString StatusStrip::statusText() const
+{
+    return m_text->fullText();
+}
+
+bool StatusStrip::isLockShown() const
+{
+    return !m_lock->isHidden();
+}
+
+QString StatusStrip::lockText() const
+{
+    return m_lock->text();
+}
+
+} // namespace tw
