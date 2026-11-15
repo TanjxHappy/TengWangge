@@ -1,13 +1,16 @@
 #include "core/data_paths.h"
 #include "core/platform_services.h"
 #include "core/tool_info.h"
+#include "shell/elided_label.h"
 #include "shell/main_window.h"
 #include "shell/status_strip.h"
+#include "shell/theme.h"
 #include "tools/md5_compare_high/md5_compare_high_tool.h"
 
 #include <QAbstractItemModel>
 #include <QApplication>
 #include <QComboBox>
+#include <QDialog>
 #include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
@@ -20,7 +23,9 @@
 #include <QLayout>
 #include <QLineEdit>
 #include <QPushButton>
+#include <QSplitter>
 #include <QTableView>
+#include <QTreeView>
 #include <QTemporaryDir>
 #include <QTest>
 
@@ -142,7 +147,8 @@ QString layoutProblem(QWidget *page)
         QStringLiteral("md5HighExport"),   QStringLiteral("md5HighFilter"),
         QStringLiteral("md5HighSearch"),   QStringLiteral("md5HighCounts"),
         QStringLiteral("md5HighTable"),    QStringLiteral("md5HighProblems"),
-        QStringLiteral("md5HighState"),
+        QStringLiteral("md5HighState"),    QStringLiteral("md5HighTreeA"),
+        QStringLiteral("md5HighTreeB"),    QStringLiteral("md5HighPreview"),
     };
     QVector<QWidget *> widgets;
     widgets.reserve(names.size());
@@ -181,11 +187,51 @@ QString layoutProblem(QWidget *page)
     }
 
     auto *table = page->findChild<QTableView *>(QStringLiteral("md5HighTable"));
-    if (table->height() < 40 || table->width() < 80)
+    if (table->height() < 40 || table->width() < 48)
         return QStringLiteral("结果表太小");
     auto *problems = page->findChild<QWidget *>(QStringLiteral("md5HighProblems"));
     if (problems->height() < 24)
         return QStringLiteral("问题列表太小");
+    auto *treeA = page->findChild<QTreeView *>(QStringLiteral("md5HighTreeA"));
+    auto *treeB = page->findChild<QTreeView *>(QStringLiteral("md5HighTreeB"));
+    if (treeA->height() < 40 || treeB->height() < 40)
+        return QStringLiteral("目录树太小");
+    auto *horizontal = page->findChild<QSplitter *>(QStringLiteral("md5HighSplitHorizontal"));
+    auto *vertical = page->findChild<QSplitter *>(QStringLiteral("md5HighSplitVertical"));
+    if (!horizontal || !vertical)
+        return QStringLiteral("缺少可拖动分隔");
+    if (horizontal->orientation() != Qt::Horizontal || horizontal->count() != 3)
+        return QStringLiteral("横向分隔不是三块");
+    if (vertical->orientation() != Qt::Vertical || vertical->count() != 2)
+        return QStringLiteral("纵向分隔不是两块");
+    if (page->width() >= 1100 && page->height() >= 700) {
+        auto *toolbar = page->findChild<QWidget *>(QStringLiteral("md5HighToolbar"));
+        if (!toolbar || toolbar->height() <= 0 || toolbar->height() >= treeA->height())
+            return QStringLiteral("工具条挤占了结果区");
+        if (treeA->height() < 120 || treeB->height() < 120 || table->height() < 120)
+            return QStringLiteral("1180 宽度下结果区不完整");
+    }
+    return {};
+}
+
+QString labelText(const QLabel *label)
+{
+    if (const auto *elided = qobject_cast<const tw::ElidedLabel *>(label))
+        return elided->fullText();
+    return label->text();
+}
+
+QModelIndex findTreePath(QTreeView *view, const QString &path, const QModelIndex &parent = QModelIndex())
+{
+    const QAbstractItemModel *model = view->model();
+    for (int row = 0; row < model->rowCount(parent); ++row) {
+        const QModelIndex index = model->index(row, 0, parent);
+        if (index.data(Qt::UserRole).toString() == path)
+            return index;
+        const QModelIndex nested = findTreePath(view, path, index);
+        if (nested.isValid())
+            return nested;
+    }
     return {};
 }
 
@@ -218,7 +264,9 @@ private slots:
     void csv_bomQuotingAndBlockedPaths();
     void filter_statusAndPath();
     void ui_compareLockFilterAndExport();
+    void ui_treesSyncDetailAndSort();
     void ui_layoutAtTypicalSizes();
+    void ui_saveReferenceShots();
     void ui_mainWindowShowsTable();
     void ui_cancelReleasesLockAndDropsRows();
     void ui_failureReleasesLock();
@@ -780,11 +828,12 @@ void Md5CompareHighTests::ui_compareLockFilterAndExport()
     QCOMPARE(harness.platform->status()->current(harness.tool.info().id).state, tw::StatusState::Success);
 
     auto *counts = harness.page->findChild<QLabel *>(QStringLiteral("md5HighCounts"));
-    QVERIFY(counts->text().contains(QStringLiteral("相同 1")));
-    QVERIFY(counts->text().contains(QStringLiteral("内容不同 1")));
-    QVERIFY(counts->text().contains(QStringLiteral("仅在目录 A 1")));
-    QVERIFY(counts->text().contains(QStringLiteral("仅在目录 B 1")));
-    QVERIFY(counts->text().contains(QStringLiteral("问题 0")));
+    const QString summary = labelText(counts);
+    QVERIFY(summary.contains(QStringLiteral("相同 1")));
+    QVERIFY(summary.contains(QStringLiteral("内容不同 1")));
+    QVERIFY(summary.contains(QStringLiteral("仅在目录 A 1")));
+    QVERIFY(summary.contains(QStringLiteral("仅在目录 B 1")));
+    QVERIFY(summary.contains(QStringLiteral("问题 0")));
 
     auto *table = harness.page->findChild<QTableView *>(QStringLiteral("md5HighTable"));
     auto *filter = harness.page->findChild<QComboBox *>(QStringLiteral("md5HighFilter"));
@@ -812,6 +861,76 @@ void Md5CompareHighTests::ui_compareLockFilterAndExport()
     QVERIFY(harness.page->findChild<QPushButton *>(QStringLiteral("md5HighExport"))->isEnabled());
 }
 
+void Md5CompareHighTests::ui_treesSyncDetailAndSort()
+{
+    Harness harness;
+    QString error;
+    QVERIFY2(harness.open(&error), qPrintable(error));
+    const QString a = harness.dir.filePath(QStringLiteral("a"));
+    const QString b = harness.dir.filePath(QStringLiteral("b"));
+    QVERIFY(writeBytes(a + QStringLiteral("/same.txt"), QByteArray("abc")));
+    QVERIFY(writeBytes(b + QStringLiteral("/same.txt"), QByteArray("abc")));
+    QVERIFY(writeBytes(a + QStringLiteral("/diff.txt"), QByteArray("one")));
+    QVERIFY(writeBytes(b + QStringLiteral("/diff.txt"), QByteArray("two")));
+    QVERIFY(writeBytes(a + QStringLiteral("/onlyA.txt"), QByteArray("a")));
+    QVERIFY(writeBytes(b + QStringLiteral("/onlyB.txt"), QByteArray("b")));
+    QVERIFY(writeBytes(a + QStringLiteral("/子目录/文件.txt"), QByteArray("abc")));
+    QVERIFY(writeBytes(b + QStringLiteral("/子目录/文件.txt"), QByteArray("xyz")));
+
+    harness.page->resize(1180, 760);
+    harness.page->show();
+    QVERIFY(QTest::qWaitForWindowExposed(harness.page));
+    harness.page->findChild<QLineEdit *>(QStringLiteral("md5HighDirA"))->setText(a);
+    harness.page->findChild<QLineEdit *>(QStringLiteral("md5HighDirB"))->setText(b);
+    harness.page->findChild<QPushButton *>(QStringLiteral("md5HighStart"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!harness.page->isBusy(), 10000);
+
+    auto *treeA = harness.page->findChild<QTreeView *>(QStringLiteral("md5HighTreeA"));
+    auto *treeB = harness.page->findChild<QTreeView *>(QStringLiteral("md5HighTreeB"));
+    auto *table = harness.page->findChild<QTableView *>(QStringLiteral("md5HighTable"));
+    QVERIFY(treeA && treeB && table);
+    QVERIFY(treeA->height() >= 120);
+    QVERIFY(table->height() >= 120);
+
+    const QModelIndex onlyA = findTreePath(treeA, QStringLiteral("onlyA.txt"));
+    QVERIFY(onlyA.isValid());
+    treeA->setCurrentIndex(onlyA);
+    QCOMPARE(treeB->currentIndex().data(Qt::UserRole).toString(), QStringLiteral("onlyA.txt"));
+    QCOMPARE(table->currentIndex().data(Qt::UserRole).toString(), QStringLiteral("onlyA.txt"));
+
+    const QModelIndex diffOnB = findTreePath(treeB, QStringLiteral("子目录/文件.txt"));
+    QVERIFY(diffOnB.isValid());
+    treeB->setCurrentIndex(diffOnB);
+    QCOMPARE(treeA->currentIndex().data(Qt::UserRole).toString(), QStringLiteral("子目录/文件.txt"));
+    QCOMPARE(table->currentIndex().data(Qt::UserRole).toString(), QStringLiteral("子目录/文件.txt"));
+
+    treeA->setFocus();
+    QTest::keyClick(treeA, Qt::Key_Return);
+    QApplication::processEvents();
+    auto *dialog = harness.page->findChild<QDialog *>(QStringLiteral("md5HighDetail"));
+    QVERIFY(dialog);
+    QVERIFY(dialog->isVisible());
+    QCOMPARE(dialog->findChild<QLabel *>(QStringLiteral("md5HighDetailPath"))->text(),
+             QStringLiteral("子目录/文件.txt"));
+    QVERIFY(!dialog->findChild<QLabel *>(QStringLiteral("md5HighDetailMd5A"))->text().isEmpty());
+    QVERIFY(dialog->findChild<QLabel *>(QStringLiteral("md5HighDetailMd5A"))->text()
+            != dialog->findChild<QLabel *>(QStringLiteral("md5HighDetailMd5B"))->text());
+    dialog->hide();
+
+    auto *filter = harness.page->findChild<QComboBox *>(QStringLiteral("md5HighFilter"));
+    filter->setCurrentIndex(filter->findText(QStringLiteral("仅在目录 A")));
+    QVERIFY(findTreePath(treeA, QStringLiteral("onlyA.txt")).isValid());
+    QVERIFY(!findTreePath(treeA, QStringLiteral("diff.txt")).isValid());
+    QVERIFY(!findTreePath(treeB, QStringLiteral("same.txt")).isValid());
+    filter->setCurrentIndex(0);
+    harness.page->findChild<QLineEdit *>(QStringLiteral("md5HighSearch"))->clear();
+
+    table->sortByColumn(0, Qt::AscendingOrder);
+    QCOMPARE(table->model()->index(0, 0).data(Qt::UserRole).toString(), QStringLiteral("diff.txt"));
+    table->sortByColumn(0, Qt::DescendingOrder);
+    QCOMPARE(table->model()->index(0, 0).data(Qt::UserRole).toString(), QStringLiteral("子目录/文件.txt"));
+}
+
 void Md5CompareHighTests::ui_layoutAtTypicalSizes()
 {
     Harness harness;
@@ -834,6 +953,71 @@ void Md5CompareHighTests::ui_layoutAtTypicalSizes()
                                                     .arg(size.height())
                                                     .arg(problem)));
     }
+}
+
+void Md5CompareHighTests::ui_saveReferenceShots()
+{
+    const QByteArray shotDir = qgetenv("MD5_HIGH_SHOT_DIR");
+    if (shotDir.isEmpty())
+        return;
+    QVERIFY(QDir().mkpath(QString::fromLocal8Bit(shotDir)));
+
+    Harness harness;
+    QString error;
+    QVERIFY2(harness.open(&error), qPrintable(error));
+    harness.page->setStyleSheet(tw::Theme::workbench().styleSheet());
+    harness.page->resize(1180, 760);
+    harness.page->show();
+    QVERIFY(QTest::qWaitForWindowExposed(harness.page));
+    QApplication::processEvents();
+    QVERIFY(harness.page->grab().save(QString::fromLocal8Bit(shotDir) + QStringLiteral("/empty-1180x760.png")));
+
+    const QString a = harness.dir.filePath(QStringLiteral("甲"));
+    const QString b = harness.dir.filePath(QStringLiteral("乙"));
+    QVERIFY(writeBytes(a + QStringLiteral("/same.txt"), QByteArray("abc")));
+    QVERIFY(writeBytes(b + QStringLiteral("/same.txt"), QByteArray("abc")));
+    QVERIFY(writeBytes(a + QStringLiteral("/diff.txt"), QByteArray("one")));
+    QVERIFY(writeBytes(b + QStringLiteral("/diff.txt"), QByteArray("two")));
+    QVERIFY(writeBytes(a + QStringLiteral("/onlyA.txt"), QByteArray("left")));
+    QVERIFY(writeBytes(b + QStringLiteral("/onlyB.txt"), QByteArray("right")));
+    QVERIFY(writeBytes(a + QStringLiteral("/子目录/文件.txt"), QByteArray("abc")));
+    QVERIFY(writeBytes(b + QStringLiteral("/子目录/文件.txt"), QByteArray("xyz")));
+    QVERIFY(QFile::link(harness.dir.filePath(QStringLiteral("outside")), a + QStringLiteral("/越界")));
+    harness.page->findChild<QLineEdit *>(QStringLiteral("md5HighDirA"))->setText(a);
+    harness.page->findChild<QLineEdit *>(QStringLiteral("md5HighDirB"))->setText(b);
+    harness.page->findChild<QPushButton *>(QStringLiteral("md5HighStart"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!harness.page->isBusy(), 10000);
+    harness.page->findChild<QTreeView *>(QStringLiteral("md5HighTreeA"))->setCurrentIndex(
+        findTreePath(harness.page->findChild<QTreeView *>(QStringLiteral("md5HighTreeA")),
+                     QStringLiteral("子目录/文件.txt")));
+    QApplication::processEvents();
+    QVERIFY(harness.page->grab().save(QString::fromLocal8Bit(shotDir) + QStringLiteral("/result-1180x760.png")));
+
+    QTemporaryDir windowDir;
+    QVERIFY(windowDir.isValid());
+    tw::ToolRegistry registry;
+    QString addError;
+    QVERIFY(registry.add(std::make_unique<tw::Md5CompareHighTool>(), &addError));
+    auto platform = std::make_unique<tw::PlatformServices>(tw::DataPaths(windowDir.filePath(QStringLiteral("data"))));
+    tw::MainWindow window(std::move(platform), std::move(registry));
+    window.setCloseGuard([](const QString &) { return true; });
+    window.resize(1180, 760);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+    QVERIFY(window.selectToolById(QStringLiteral("md5-compare-high")));
+    QApplication::processEvents();
+    QVERIFY(window.grab().save(QString::fromLocal8Bit(shotDir) + QStringLiteral("/window-empty-1180x760.png")));
+
+    auto *embedded = window.findChild<tw::Md5CompareHighPage *>();
+    QVERIFY(embedded);
+    embedded->findChild<QLineEdit *>(QStringLiteral("md5HighDirA"))->setText(a);
+    embedded->findChild<QLineEdit *>(QStringLiteral("md5HighDirB"))->setText(b);
+    embedded->findChild<QPushButton *>(QStringLiteral("md5HighStart"))->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!embedded->isBusy(), 10000);
+    auto *embeddedTree = embedded->findChild<QTreeView *>(QStringLiteral("md5HighTreeA"));
+    embeddedTree->setCurrentIndex(findTreePath(embeddedTree, QStringLiteral("子目录/文件.txt")));
+    QApplication::processEvents();
+    QVERIFY(window.grab().save(QString::fromLocal8Bit(shotDir) + QStringLiteral("/window-result-1180x760.png")));
 }
 
 void Md5CompareHighTests::ui_mainWindowShowsTable()
