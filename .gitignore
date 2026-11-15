@@ -1,0 +1,8 @@
+/build/
+/build-*/
+/out/
+/install/
+*.user
+*.autosave
+CMakeLists.txt.user*
+.DS_Store
