@@ -76,7 +76,7 @@ private:
     QPushButton *m_export = nullptr;
     QProgressBar *m_bar = nullptr;
     ElidedLabel *m_state = nullptr;
-    QLabel *m_counts = nullptr;
+    ElidedLabel *m_counts = nullptr;
     QLabel *m_visible = nullptr;
     QComboBox *m_filter = nullptr;
     QLineEdit *m_search = nullptr;

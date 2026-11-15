@@ -13,6 +13,7 @@
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
+#include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QPlainTextEdit>
@@ -149,6 +150,7 @@ private slots:
     void ui_shutdownDuringExportReleasesLock();
     void ui_layoutStaysSeparatedWhenNarrow();
     void ui_tableVisibleInDefaultWindow();
+    void ui_fiveResultRowsFitInDefaultWindow();
     void ui_shutdownWhileRunningReleasesLock();
     void ui_remembersPathsOnlyInDataDir();
 };
@@ -814,7 +816,7 @@ void Md5CompareTests::ui_compareShowsRowsAndReleasesLock()
     auto *table = page->findChild<QTableView *>(QStringLiteral("md5Table"));
     auto *filter = page->findChild<QComboBox *>(QStringLiteral("md5Filter"));
     auto *search = page->findChild<QLineEdit *>(QStringLiteral("md5Search"));
-    auto *counts = page->findChild<QLabel *>(QStringLiteral("md5Counts"));
+    auto *counts = page->findChild<tw::ElidedLabel *>(QStringLiteral("md5Counts"));
     auto *exportButton = page->findChild<QPushButton *>(QStringLiteral("md5Export"));
     QVERIFY(editA && editB && start && table && filter && search && counts && exportButton);
     editA->setText(dirA);
@@ -830,11 +832,11 @@ void Md5CompareTests::ui_compareShowsRowsAndReleasesLock()
     QVERIFY(!platform.gate()->isLocked());
     QVERIFY(exportButton->isEnabled());
     QCOMPARE(table->model()->rowCount(), 4);
-    QVERIFY(counts->text().contains(QStringLiteral("相同 1")));
-    QVERIFY(counts->text().contains(QStringLiteral("内容不同 1")));
-    QVERIFY(counts->text().contains(QStringLiteral("仅在目录 A 1")));
-    QVERIFY(counts->text().contains(QStringLiteral("仅在目录 B 1")));
-    QVERIFY(counts->text().contains(QStringLiteral("问题 0")));
+    QVERIFY(counts->fullText().contains(QStringLiteral("相同 1")));
+    QVERIFY(counts->fullText().contains(QStringLiteral("内容不同 1")));
+    QVERIFY(counts->fullText().contains(QStringLiteral("仅在目录 A 1")));
+    QVERIFY(counts->fullText().contains(QStringLiteral("仅在目录 B 1")));
+    QVERIFY(counts->fullText().contains(QStringLiteral("问题 0")));
     QCOMPARE(platform.status()->current(tool.info().id).state, tw::StatusState::Success);
 
     filter->setCurrentIndex(filter->findText(QStringLiteral("仅在目录 A")));
@@ -879,10 +881,10 @@ void Md5CompareTests::ui_problemResultIsNotShownAsSuccess()
     QVERIFY(!platform.gate()->isLocked());
     QCOMPARE(platform.status()->current(tool.info().id).state, tw::StatusState::Info);
     auto *state = page->findChild<tw::ElidedLabel *>(QStringLiteral("md5State"));
-    auto *counts = page->findChild<QLabel *>(QStringLiteral("md5Counts"));
+    auto *counts = page->findChild<tw::ElidedLabel *>(QStringLiteral("md5Counts"));
     QVERIFY(state && counts);
     QVERIFY(state->fullText().contains(QStringLiteral("问题")));
-    QVERIFY(counts->text().contains(QStringLiteral("问题 1")));
+    QVERIFY(counts->fullText().contains(QStringLiteral("问题 1")));
 }
 
 void Md5CompareTests::ui_exportHoldsLockAndRejectsComparedDir()
@@ -1089,10 +1091,68 @@ void Md5CompareTests::ui_tableVisibleInDefaultWindow()
         if (size.height() >= 760) {
             const QRect visible = tableBox.intersected(window.rect());
             const QRect problemsVisible = problemBox.intersected(window.rect());
-            QVERIFY2(visible.height() >= table->fontMetrics().height(), qPrintable(dump));
+            const int row = qMax(1, table->verticalHeader()->defaultSectionSize());
+            QVERIFY2(visible.height() >= row * 5, qPrintable(dump));
+            QVERIFY2(table->viewport()->height() >= row * 5, qPrintable(dump));
             QVERIFY2(problemsVisible.height() >= problems->fontMetrics().height(), qPrintable(dump));
         }
     }
+}
+
+void Md5CompareTests::ui_fiveResultRowsFitInDefaultWindow()
+{
+    QTemporaryDir temp;
+    QVERIFY(temp.isValid());
+    const QString dirA = temp.filePath(QStringLiteral("a"));
+    const QString dirB = temp.filePath(QStringLiteral("b"));
+    QVERIFY(writeFile(dirA + QStringLiteral("/same.txt"), "same"));
+    QVERIFY(writeFile(dirB + QStringLiteral("/same.txt"), "same"));
+    QVERIFY(writeFile(dirA + QStringLiteral("/diff.txt"), "aaa"));
+    QVERIFY(writeFile(dirB + QStringLiteral("/diff.txt"), "bbb"));
+    QVERIFY(writeFile(dirA + QStringLiteral("/onlyA.txt"), "a"));
+    QVERIFY(writeFile(dirB + QStringLiteral("/onlyB.txt"), "b"));
+    QVERIFY(writeFile(dirA + QStringLiteral("/nested/fifth.txt"), "e"));
+    QVERIFY(writeFile(dirB + QStringLiteral("/nested/fifth.txt"), "e"));
+
+    auto platform = std::make_unique<tw::PlatformServices>(tw::DataPaths(temp.filePath(QStringLiteral("data"))));
+    tw::ToolRegistry registry;
+    QString error;
+    QVERIFY2(registry.add(std::make_unique<tw::Md5CompareTool>(), &error), qPrintable(error));
+    tw::MainWindow window(std::move(platform), std::move(registry));
+    window.resize(1180, 760);
+    window.show();
+    QVERIFY(QTest::qWaitForWindowExposed(&window));
+
+    auto *page = window.findChild<tw::Md5ComparePage *>();
+    auto *editA = window.findChild<QLineEdit *>(QStringLiteral("md5DirA"));
+    auto *editB = window.findChild<QLineEdit *>(QStringLiteral("md5DirB"));
+    auto *start = window.findChild<QPushButton *>(QStringLiteral("md5Start"));
+    auto *table = window.findChild<QTableView *>(QStringLiteral("md5Table"));
+    auto *counts = window.findChild<tw::ElidedLabel *>(QStringLiteral("md5Counts"));
+    QVERIFY(page && editA && editB && start && table && counts);
+    for (QLabel *label : page->findChildren<QLabel *>()) {
+        const QString role = label->property("role").toString();
+        QVERIFY(role != QLatin1String("pageTitle"));
+        QVERIFY(role != QLatin1String("pageSubtitle"));
+    }
+    editA->setText(dirA);
+    editB->setText(dirB);
+    start->click();
+    QTRY_VERIFY_WITH_TIMEOUT(!page->isBusy(), 5000);
+    QCOMPARE(table->model()->rowCount(), 5);
+    QVERIFY(counts->fullText().contains(QStringLiteral("相同 2")));
+    const int row = qMax(1, table->verticalHeader()->defaultSectionSize());
+    const QRect tableBox(table->mapTo(&window, QPoint(0, 0)), table->size());
+    const QRect visible = tableBox.intersected(window.rect());
+    const QString dump = QStringLiteral("viewport=%1 visible=%2 row=%3")
+                             .arg(table->viewport()->height())
+                             .arg(visible.height())
+                             .arg(row);
+    QVERIFY2(table->viewport()->height() >= row * 5, qPrintable(dump));
+    QVERIFY2(visible.height() >= row * 5, qPrintable(dump));
+    const QString shot = qEnvironmentVariable("MD5_COMPARE_SHOT");
+    if (!shot.isEmpty())
+        QVERIFY(window.grab().save(shot));
 }
 
 void Md5CompareTests::ui_shutdownWhileRunningReleasesLock()

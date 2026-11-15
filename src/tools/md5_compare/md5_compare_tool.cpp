@@ -326,23 +326,14 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
 
     auto *body = new QWidget;
     auto *layout = new QVBoxLayout(body);
-    layout->setContentsMargins(28, 24, 28, 24);
-    layout->setSpacing(14);
+    layout->setContentsMargins(12, 8, 12, 8);
+    layout->setSpacing(6);
 
-    layout->addWidget(makeLabel(QStringLiteral("目录 MD5 比较"), "pageTitle"));
-    layout->addWidget(makeLabel(
-        QStringLiteral("选择两个已存在的目录，递归比较其中的普通文件。按相对路径对齐并计算 MD5。"
-                       "指向起始目录之外或会形成循环的符号链接会记入问题，不会跟随。"),
-        "pageSubtitle"));
-
-    auto *card = new QFrame;
-    card->setProperty("role", QStringLiteral("card"));
-    card->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Minimum);
-    auto *grid = new QGridLayout(card);
-    grid->setContentsMargins(16, 14, 16, 14);
-    grid->setHorizontalSpacing(12);
-    grid->setVerticalSpacing(10);
-    grid->setColumnStretch(1, 1);
+    const QString howTo = QStringLiteral(
+        "递归比较两个已有目录里的普通文件，按相对路径计算 MD5。"
+        "指向目录外或会循环的符号链接记入问题，不会跟随。"
+        "比较在后台进行，不会修改这两个目录。上次的路径只保存在本工具自己的数据里。");
+    setToolTip(howTo);
 
     auto *labelA = makeLabel(QStringLiteral("目录 A"), "fieldLabel", false);
     auto *labelB = makeLabel(QStringLiteral("目录 B"), "fieldLabel", false);
@@ -365,6 +356,8 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_dirB->setMinimumHeight(editHeight);
     labelA->setBuddy(m_dirA);
     labelB->setBuddy(m_dirB);
+    m_dirA->setToolTip(howTo);
+    m_dirB->setToolTip(howTo);
 
     m_browseA = new QPushButton(QStringLiteral("浏览…"));
     m_browseB = new QPushButton(QStringLiteral("浏览…"));
@@ -377,15 +370,19 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_browseA->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
     m_browseB->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
 
-    grid->addWidget(labelA, 0, 0);
-    grid->addWidget(m_dirA, 0, 1);
-    grid->addWidget(m_browseA, 0, 2);
-    grid->addWidget(labelB, 1, 0);
-    grid->addWidget(m_dirB, 1, 1);
-    grid->addWidget(m_browseB, 1, 2);
+    auto *dirs = new QHBoxLayout;
+    dirs->setSpacing(8);
+    dirs->addWidget(labelA);
+    dirs->addWidget(m_dirA, 1);
+    dirs->addWidget(m_browseA);
+    dirs->addSpacing(8);
+    dirs->addWidget(labelB);
+    dirs->addWidget(m_dirB, 1);
+    dirs->addWidget(m_browseB);
+    layout->addLayout(dirs);
 
-    auto *buttons = new QHBoxLayout;
-    buttons->setSpacing(8);
+    auto *actions = new QHBoxLayout;
+    actions->setSpacing(8);
     m_start = new QPushButton(QStringLiteral("开始比较"));
     m_cancel = new QPushButton(QStringLiteral("取消"));
     m_export = new QPushButton(QStringLiteral("导出报告"));
@@ -403,11 +400,10 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_start->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
     m_cancel->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
     m_export->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
-    buttons->addWidget(m_start);
-    buttons->addWidget(m_cancel);
-    buttons->addWidget(m_export);
-    buttons->addStretch(1);
-    grid->addLayout(buttons, 2, 0, 1, 3);
+    m_start->setToolTip(howTo);
+    actions->addWidget(m_start);
+    actions->addWidget(m_cancel);
+    actions->addWidget(m_export);
 
     m_bar = new QProgressBar;
     m_bar->setObjectName(QStringLiteral("md5Progress"));
@@ -416,21 +412,22 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_bar->setValue(0);
     m_bar->setTextVisible(true);
     m_bar->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    grid->addWidget(m_bar, 3, 0, 1, 3);
+    m_bar->setMinimumWidth(0);
+    actions->addWidget(m_bar, 2);
 
     m_state = new ElidedLabel;
     m_state->setProperty("role", QStringLiteral("sectionTitle"));
     m_state->setObjectName(QStringLiteral("md5State"));
     m_state->setFullText(QStringLiteral("尚未比较"));
-    grid->addWidget(m_state, 4, 0, 1, 3);
+    m_state->setToolTip(howTo);
+    actions->addWidget(m_state, 1);
+    layout->addLayout(actions);
 
-    grid->addWidget(makeLabel(QStringLiteral("不会修改这两个目录。上次使用的路径只写在本工具自己的数据里。"),
-                              "hint"),
-                    5, 0, 1, 3);
-    layout->addWidget(card);
-
-    m_counts = makeLabel(emptyCounts(), "sectionTitle");
+    m_counts = new ElidedLabel;
+    m_counts->setProperty("role", QStringLiteral("sectionTitle"));
     m_counts->setObjectName(QStringLiteral("md5Counts"));
+    m_counts->setFullText(emptyCounts());
+    m_counts->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
     layout->addWidget(m_counts);
 
     auto *filters = new QHBoxLayout;
@@ -459,15 +456,14 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_filter->addItem(compareStatusLabel(CompareStatus::OnlyInA), static_cast<int>(CompareStatus::OnlyInA));
     m_filter->addItem(compareStatusLabel(CompareStatus::OnlyInB), static_cast<int>(CompareStatus::OnlyInB));
     m_filter->addItem(compareStatusLabel(CompareStatus::Problem), static_cast<int>(CompareStatus::Problem));
+    m_visible = makeLabel(QStringLiteral("当前显示 0 条"), "hint", false);
+    m_visible->setObjectName(QStringLiteral("md5Visible"));
     filters->addWidget(filterLabel);
     filters->addWidget(m_filter);
     filters->addWidget(searchLabel);
     filters->addWidget(m_search, 1);
+    filters->addWidget(m_visible);
     layout->addLayout(filters);
-
-    m_visible = makeLabel(QStringLiteral("当前显示 0 条"), "hint");
-    m_visible->setObjectName(QStringLiteral("md5Visible"));
-    layout->addWidget(m_visible);
 
     m_model = new CompareResultModel(this);
     m_table = new QTableView;
@@ -487,7 +483,7 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_table->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
     const int textHeight = qMax(1, m_table->fontMetrics().height());
     const int headerHeight = qMax(textHeight, m_table->horizontalHeader()->sizeHint().height());
-    m_table->setMinimumHeight(headerHeight + textHeight * 2);
+    m_table->setMinimumHeight(headerHeight + textHeight * 5);
     m_table->verticalHeader()->setVisible(false);
     m_table->horizontalHeader()->setStretchLastSection(true);
     m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
@@ -499,9 +495,8 @@ Md5ComparePage::Md5ComparePage(const ToolServices &services, QWidget *parent)
     m_table->horizontalHeader()->setMinimumSectionSize(columnFloor);
     const int statusWidth = m_table->fontMetrics().horizontalAdvance(QStringLiteral("仅在目录 B")) + 28;
     m_table->setColumnWidth(1, statusWidth);
-    layout->addWidget(m_table, 3);
+    layout->addWidget(m_table, 8);
 
-    layout->addWidget(makeLabel(QStringLiteral("问题"), "sectionTitle"));
     m_problems = new QPlainTextEdit;
     m_problems->setObjectName(QStringLiteral("md5Problems"));
     m_problems->setAccessibleName(QStringLiteral("问题列表"));
@@ -635,7 +630,7 @@ void Md5ComparePage::startCompare()
     m_result = {};
     m_model->setEntries({});
     m_problems->clear();
-    m_counts->setText(emptyCounts());
+    m_counts->setFullText(emptyCounts());
     applyFilter();
     m_bar->setRange(0, 0);
     m_state->setFullText(QStringLiteral("正在列出文件…"));
@@ -747,7 +742,7 @@ void Md5ComparePage::onFinished()
         m_result = {};
         m_model->setEntries({});
         m_problems->clear();
-        m_counts->setText(emptyCounts());
+        m_counts->setFullText(emptyCounts());
         m_bar->setValue(0);
         m_state->setFullText(QStringLiteral("已取消"));
         m_services.logWarning(QStringLiteral("比较已取消"));
@@ -757,7 +752,7 @@ void Md5ComparePage::onFinished()
         m_result = {};
         m_model->setEntries({});
         m_problems->clear();
-        m_counts->setText(emptyCounts());
+        m_counts->setFullText(emptyCounts());
         m_bar->setValue(0);
         showFailure(error);
     } else {
@@ -767,7 +762,7 @@ void Md5ComparePage::onFinished()
         m_result = result;
         m_model->setEntries(result.entries);
         m_problems->setPlainText(formatProblems(result));
-        m_counts->setText(formatCounts(result));
+        m_counts->setFullText(formatCounts(result));
         m_bar->setValue(100);
         const QString summary = formatCounts(result);
         QString state = QStringLiteral("比较完成");
